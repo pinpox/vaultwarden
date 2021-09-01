@@ -575,10 +575,8 @@ fn get_client_from_identifier (identifier: &str, conn: &DbConn) -> CoreClient {
 
     match organization {
         Some(organization) => {
-            println!("found org. authority: {}", organization.authority);
             let redirect = organization.callback_path.to_string();
             let issuer = reqwest::Url::parse(&organization.authority).unwrap();
-            println!("got issuer: {}", issuer);
             let client_id = ClientId::new(organization.client_id);
             let client_secret = ClientSecret::new(organization.client_secret);
             let issuer_url = IssuerUrl::new(organization.authority).expect("invalid issuer URL");
@@ -656,7 +654,6 @@ fn get_auth_code_access_token (
 
     let access_token = token_response.access_token().secret().to_string();
     let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
-    println!("access token: {}, refresh token: {}", access_token, refresh_token);
 
     (access_token, refresh_token)
 }
