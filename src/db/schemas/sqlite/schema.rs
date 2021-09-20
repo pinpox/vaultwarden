@@ -210,6 +210,14 @@ table! {
 }
 
 table! {
+    sso_nonce (uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        nonce -> Text,
+    }
+}
+
+table! {
     emergency_access (uuid) {
         uuid -> Text,
         grantor_uuid -> Text,
@@ -245,6 +253,7 @@ joinable!(users_collections -> users (user_uuid));
 joinable!(users_organizations -> organizations (org_uuid));
 joinable!(users_organizations -> users (user_uuid));
 joinable!(emergency_access -> users (grantor_uuid));
+joinable!(sso_nonce -> organizations (org_uuid));
 
 allow_tables_to_appear_in_same_query!(
     attachments,
