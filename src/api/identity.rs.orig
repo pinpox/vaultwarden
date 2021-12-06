@@ -106,9 +106,9 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
     };
 
     let token = jsonwebtoken::dangerous_insecure_decode::<TokenPayload>(access_token.as_str()).unwrap().claims;
-    // let expiry = token.exp;
-    // let user_email = token.email;
-    // let now = Utc::now().naive_utc();
+    let expiry = token.exp;
+    let user_email = token.email;
+    let now = Local::now();
     let nonce = token.nonce;
 
     match SsoNonce::find_by_org_and_nonce(&organization.uuid, &nonce, &conn) {
@@ -117,7 +117,7 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
                 Ok(_) => {
                     let expiry = token.exp;
                     let user_email = token.email;
-                    let now = Utc::now().naive_utc();
+                    let now = Local::now();
 
                     // COMMON
                     let user = User::find_by_mail(&user_email, &conn).unwrap();
@@ -141,7 +141,7 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
 
                     let mut result = json!({
                         "access_token": access_token,
-                        "expires_in": expiry - now.timestamp(),
+                        "expires_in": expiry - now.naive_utc().timestamp(),
                         "token_type": "Bearer",
                         "refresh_token": refresh_token,
                         "Key": user.akey,
@@ -589,7 +589,7 @@ fn get_client_from_sso_config (sso_config: &SsoConfig) -> Result<CoreClient, &'s
     let redirect = sso_config.callback_path.to_string();
     let client_id = ClientId::new(sso_config.client_id.as_ref().unwrap().to_string());
     let client_secret = ClientSecret::new(sso_config.client_secret.as_ref().unwrap().to_string());
-    let issuer_url = IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
+    let issuer_url = IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).expect("invalid issuer URL");
     let provider_metadata = match CoreProviderMetadata::discover(&issuer_url, http_client) {
         Ok(metadata) => metadata,
         Err(_err) => {
@@ -601,7 +601,7 @@ fn get_client_from_sso_config (sso_config: &SsoConfig) -> Result<CoreClient, &'s
         client_id,
         Some(client_secret),
     )
-    .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
+    .set_redirect_uri(RedirectUrl::new(redirect).expect("Invalid redirect URL"));
     return Ok(client);
 }
 
@@ -649,10 +649,19 @@ fn authorize(
 
 fn get_auth_code_access_token (
     code: &str,
+<<<<<<< HEAD
+    org_identifier: &str,
+    conn: &DbConn,
+) -> Result<(String, String), &'static str> {
+    let oidc_code = AuthorizationCode::new(String::from(code));
+
+    match get_client_from_identifier(org_identifier, conn) {
+=======
     sso_config: &SsoConfig,
 ) -> Result<(String, String), &'static str> {
     let oidc_code = AuthorizationCode::new(String::from(code));
     match get_client_from_sso_config(sso_config) {
+>>>>>>> 5c7161d (split sso_config into own table)
         Ok(client) => {
             match client.exchange_code(oidc_code).request(http_client) {
                 Ok(token_response) => {
