@@ -12,6 +12,7 @@ db_object! {
         pub uuid: String,
         pub name: String,
         pub billing_email: String,
+        pub identifier: Option<String>,
         pub private_key: Option<String>,
         pub public_key: Option<String>,
     }
@@ -131,13 +132,14 @@ impl Organization {
             billing_email,
             private_key,
             public_key,
+            identifier: None,
         }
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "Id": self.uuid,
-            "Identifier": null, // not supported by us
+            "Identifier": self.identifier,
             "Name": self.name,
             "Seats": 10, // The value doesn't matter, we don't check server-side
             "MaxCollections": 10, // The value doesn't matter, we don't check server-side
@@ -148,7 +150,6 @@ impl Organization {
             "UseGroups": false, // not supported by us
             "UseTotp": true,
             "UsePolicies": true,
-            "UseSso": false, // We do not support SSO
             "SelfHost": true,
             "UseApi": false, // not supported by us
             "HasPublicAndPrivateKeys": self.private_key.is_some() && self.public_key.is_some(),
@@ -254,6 +255,15 @@ impl Organization {
         }}
     }
 
+    pub fn find_by_identifier(identifier: &str, conn: &DbConn) -> Option<Self> {
+        db_run! { conn: {
+            organizations::table
+                .filter(organizations::identifier.eq(identifier))
+                .first::<OrganizationDb>(conn)
+                .ok().from_db()
+        }}
+    }
+
     pub fn get_all(conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             organizations::table.load::<OrganizationDb>(conn).expect("Error loading organizations").from_db()
@@ -283,8 +293,8 @@ impl UserOrganization {
             "SelfHost": true,
             "HasPublicAndPrivateKeys": org.private_key.is_some() && org.public_key.is_some(),
             "ResetPasswordEnrolled": false, // not supported by us
-            "SsoBound": false, // We do not support SSO
-            "UseSso": false, // We do not support SSO
+            "SsoBound": true,
+            "UseSso": true,
             // TODO: Add support for Business Portal
             // Upstream is moving Policies and SSO management outside of the web-vault to /portal
             // For now they still have that code also in the web-vault, but they will remove it at some point.

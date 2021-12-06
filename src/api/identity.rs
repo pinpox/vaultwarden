@@ -1,11 +1,14 @@
 use chrono::Utc;
 use num_traits::FromPrimitive;
 use rocket::{
+    http::Status,
     request::{Form, FormItems, FromForm},
+    response::Redirect,
     Route,
 };
 use rocket_contrib::json::Json;
 use serde_json::Value;
+use std::iter::FromIterator;
 
 use crate::{
     api::{
@@ -19,7 +22,7 @@ use crate::{
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![login]
+    routes![login, prevalidate, authorize]
 }
 
 #[post("/connect/token", data = "<data>")]
@@ -42,6 +45,13 @@ fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResult {
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
             _password_login(data, conn, &ip)
+        }
+        "authorization_code" => {
+            _check_is_some(&data.code, "code cannot be blank")?;
+            _check_is_some(&data.org_identifier, "org_identifier cannot be blank")?;
+            _check_is_some(&data.device_identifier, "device identifier cannot be blank")?;
+
+            _authorization_login(data, conn, &ip)
         }
         t => err!("Invalid type", t),
     }
@@ -77,6 +87,88 @@ fn _refresh_login(data: ConnectData, conn: DbConn) -> JsonResult {
     })))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TokenPayload {
+    exp: i64,
+    email: String,
+    nonce: String,
+}
+
+fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
+    let org_identifier = data.org_identifier.as_ref().unwrap();
+    let code = data.code.as_ref().unwrap();
+    let organization = Organization::find_by_identifier(org_identifier, &conn).unwrap();
+    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).unwrap();
+
+    let (access_token, refresh_token) = match get_auth_code_access_token(&code, &sso_config) {
+        Ok((access_token, refresh_token)) => (access_token, refresh_token),
+        Err(err) => err!(err),
+    };
+
+    let token = jsonwebtoken::dangerous_insecure_decode::<TokenPayload>(access_token.as_str()).unwrap().claims;
+    let expiry = token.exp;
+    let user_email = token.email;
+    let now = Local::now();
+    let nonce = token.nonce;
+
+    match SsoNonce::find_by_org_and_nonce(&organization.uuid, &nonce, &conn) {
+        Some(sso_nonce) => {
+            match sso_nonce.delete(&conn) {
+                Ok(_) => {
+                    let expiry = token.exp;
+                    let user_email = token.email;
+                    let now = Local::now();
+
+                    // COMMON
+                    let user = User::find_by_mail(&user_email, &conn).unwrap();
+
+                    let (mut device, new_device) = get_device(&data, &conn, &user);
+
+                    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, &conn)?;
+
+                    if CONFIG.mail_enabled() && new_device {
+                        if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name) {
+                            error!("Error sending new device email: {:#?}", e);
+
+                            if CONFIG.require_device_email() {
+                                err!("Could not send login notification email. Please contact your administrator.")
+                            }
+                        }
+                    }
+
+                    device.refresh_token = refresh_token.clone();
+                    device.save(&conn)?;
+
+                    let mut result = json!({
+                        "access_token": access_token,
+                        "expires_in": expiry - now.naive_utc().timestamp(),
+                        "token_type": "Bearer",
+                        "refresh_token": refresh_token,
+                        "Key": user.akey,
+                        "PrivateKey": user.private_key,
+
+                        "Kdf": user.client_kdf_type,
+                        "KdfIterations": user.client_kdf_iter,
+                        "ResetMasterPassword": false, // TODO: according to official server seems something like: user.password_hash.is_empty(), but would need testing
+                        "scope": "api offline_access",
+                        "unofficialServer": true,
+                    });
+
+                    if let Some(token) = twofactor_token {
+                        result["TwoFactorToken"] = Value::String(token);
+                    }
+
+                    Ok(Json(result))
+                },
+                Err(_) => err!("Failed to delete nonce"),
+            }
+        },
+        None => {
+            err!("Invalid nonce")
+        }
+    }
+}
+
 fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
     // Validate scope
     let scope = data.scope.as_ref().unwrap();
@@ -100,6 +192,15 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult
     // Check if the user is disabled
     if !user.enabled {
         err!("This user has been disabled", format!("IP: {}. Username: {}.", ip.ip, username))
+    }
+
+    // Check if org policy prevents password login
+    let user_orgs = UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::RequireSso, &conn);
+    if user_orgs.len() >= 1 && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
+        // if requires SSO is active, user is in exactly one org by policy rules
+        // policy only applies to "non-owner/non-admin" members
+
+        err!("Organization policy requires SSO sign in");
     }
 
     let now = Utc::now().naive_utc();
@@ -395,6 +496,10 @@ struct ConnectData {
     two_factor_provider: Option<i32>,
     two_factor_token: Option<String>,
     two_factor_remember: Option<i32>,
+
+    // Needed for authorization code
+    code: Option<String>,
+    org_identifier: Option<String>,
 }
 
 impl<'f> FromForm<'f> for ConnectData {
@@ -421,10 +526,11 @@ impl<'f> FromForm<'f> for ConnectData {
                 "twofactorprovider" => form.two_factor_provider = value.parse().ok(),
                 "twofactortoken" => form.two_factor_token = Some(value),
                 "twofactorremember" => form.two_factor_remember = value.parse().ok(),
+                "code" => form.code = Some(value),
+                "orgidentifier" => form.org_identifier = Some(value),
                 key => warn!("Detected unexpected parameter during login: {}", key),
             }
         }
-
         Ok(form)
     }
 }
@@ -434,4 +540,131 @@ fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
         err!(msg)
     }
     Ok(())
+}
+
+#[get("/account/prevalidate?<domainHint>")]
+#[allow(non_snake_case)]
+// The compiler warns about unreachable code here. But I've tested it, and it seems to work
+// as expected. All errors appear to be reachable, as is the Ok response.
+#[allow(unreachable_code)]
+fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
+    let empty_result = json!({});
+    let organization = Organization::find_by_identifier(&domainHint, &conn).unwrap();
+    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn);
+    match sso_config {
+        Some(sso_config) => {
+            if !sso_config.use_sso {
+                return err_code!("SSO Not allowed for organization", Status::BadRequest.code);
+            }
+            if sso_config.authority.is_none()
+                || sso_config.client_id.is_none()
+                || sso_config.client_secret.is_none() {
+                return err_code!("Organization is incorrectly configured for SSO", Status::BadRequest.code);
+            }
+        },
+        None => {
+            return err_code!("Unable to find sso config", Status::BadRequest.code);
+        },
+    }
+
+    if domainHint == "" {
+        return err_code!("No Organization Identifier Provided", Status::BadRequest.code);
+    }
+
+    Ok(Json(empty_result))
+}
+
+use openidconnect::core::{
+    CoreProviderMetadata, CoreClient,
+    CoreResponseType,
+};
+use openidconnect::reqwest::http_client;
+use openidconnect::{
+    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret,
+    CsrfToken, IssuerUrl, Nonce, RedirectUrl,
+    Scope, OAuth2TokenResponse,
+};
+
+fn get_client_from_sso_config (sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
+    let redirect = sso_config.callback_path.to_string();
+    let client_id = ClientId::new(sso_config.client_id.as_ref().unwrap().to_string());
+    let client_secret = ClientSecret::new(sso_config.client_secret.as_ref().unwrap().to_string());
+    let issuer_url = IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
+    let provider_metadata = match CoreProviderMetadata::discover(&issuer_url, http_client) {
+        Ok(metadata) => metadata,
+        Err(_err) => {
+            return Err("Failed to discover OpenID provider");
+        },
+    };
+    let client = CoreClient::from_provider_metadata(
+        provider_metadata,
+        client_id,
+        Some(client_secret),
+    )
+    .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
+    return Ok(client);
+}
+
+#[get("/connect/authorize?<domain_hint>&<state>")]
+fn authorize(
+    domain_hint: String,
+    state: String,
+    conn: DbConn,
+) -> ApiResult<Redirect> {
+    let organization = Organization::find_by_identifier(&domain_hint, &conn).unwrap();
+    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).unwrap();
+    match get_client_from_sso_config(&sso_config) {
+        Ok(client) => {
+            let (mut authorize_url, _csrf_state, nonce) = client
+                .authorize_url(
+                    AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+                    CsrfToken::new_random,
+                    Nonce::new_random,
+                )
+                .add_scope(Scope::new("email".to_string()))
+                .add_scope(Scope::new("profile".to_string()))
+                .url();
+
+            let sso_nonce = SsoNonce::new(organization.uuid, nonce.secret().to_string());
+            sso_nonce.save(&conn)?;
+
+            // it seems impossible to set the state going in dynamically (requires static lifetime string)
+            // so I change it after the fact
+            let old_pairs = authorize_url.query_pairs().clone();
+            let new_pairs = old_pairs.map(|pair| {
+                let (key, value) = pair;
+                if key == "state" {
+                    return format!("{}={}", key, state);
+                }
+                return format!("{}={}", key, value);
+            });
+            let full_query = Vec::from_iter(new_pairs).join("&");
+            authorize_url.set_query(Some(full_query.as_str()));
+
+            return Ok(Redirect::to(authorize_url.to_string()));
+        },
+        Err(_err) => err!("Unable to find client from identifier"),
+    }
+}
+
+fn get_auth_code_access_token (
+    code: &str,
+    sso_config: &SsoConfig,
+) -> Result<(String, String), &'static str> {
+    let oidc_code = AuthorizationCode::new(String::from(code));
+    match get_client_from_sso_config(sso_config) {
+        Ok(client) => {
+            match client.exchange_code(oidc_code).request(http_client) {
+                Ok(token_response) => {
+                    let access_token = token_response.access_token().secret().to_string();
+                    let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
+
+                    Ok((access_token, refresh_token))
+                },
+                Err(_err) => Err("Failed to contact token endpoint"),
+            }
+
+        },
+        Err(_err) => Err("unable to find client"),
+    }
 }
