@@ -3,7 +3,7 @@ target
 
 # Data folder
 data
-.env
+# .env
 .env.template
 .gitattributes
 
@@ -24,4 +24,4 @@ hooks
 tools
 
 # Web vault
-web-vault
+# web-vault
