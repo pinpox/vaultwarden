@@ -24,7 +24,7 @@
 #     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
 #     [vaultwarden/web-vault:v2.24.1]
 #
-FROM vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b as vault
+# FROM vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b as vault
 
 ########################## BUILD IMAGE  ##########################
 FROM rust:1.55-buster as build
@@ -113,7 +113,8 @@ EXPOSE 3012
 # and the binary from the "build" stage to the current stage
 WORKDIR /
 COPY Rocket.toml .
-COPY --from=vault /web-vault ./web-vault
+# COPY --from=vault /web-vault ./web-vault
+COPY ./web-vault/build ./web-vault
 COPY --from=build /app/target/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh
