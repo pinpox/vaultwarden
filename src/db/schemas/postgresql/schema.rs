@@ -42,7 +42,7 @@ table! {
 }
 
 table! {
-    devices (uuid) {
+    devices (uuid, user_uuid) {
         uuid -> Text,
         created_at -> Timestamp,
         updated_at -> Timestamp,
@@ -192,6 +192,7 @@ table! {
         excluded_globals -> Text,
         client_kdf_type -> Integer,
         client_kdf_iter -> Integer,
+        api_key -> Nullable<Text>,
     }
 }
 

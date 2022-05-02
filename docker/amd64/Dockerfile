@@ -16,21 +16,21 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.24.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.24.1
-#     [vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b]
+#     $ docker pull vaultwarden/web-vault:v2.28.0
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.28.0
+#     [vaultwarden/web-vault@sha256:ad3b47c152206f25f2d2b70a93e68650a90d5c8105b894814f9bc7599517a603]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
-#     [vaultwarden/web-vault:v2.24.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:ad3b47c152206f25f2d2b70a93e68650a90d5c8105b894814f9bc7599517a603
+#     [vaultwarden/web-vault:v2.28.0]
 #
+
 # FROM vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.55-buster as build
+FROM rust:1.59-bullseye as build
 
-# Debian-based builds support multidb
-ARG DB=sqlite,mysql,postgresql
+
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -64,6 +64,9 @@ COPY ./rust-toolchain ./rust-toolchain
 COPY ./build.rs ./build.rs
 
 
+# Configure the DB ARG as late as possible to not invalidate the cached layers above
+ARG DB=sqlite,mysql,postgresql
+
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
@@ -79,16 +82,17 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
+# hadolint ignore=DL3059
 RUN cargo build --features ${DB} --release
 
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM debian:buster-slim
+FROM debian:bullseye-slim
 
-ENV ROCKET_ENV "staging"
-ENV ROCKET_PORT=80
-ENV ROCKET_WORKERS=10
+ENV ROCKET_PROFILE="release" \
+    ROCKET_ADDRESS=0.0.0.0 \
+    ROCKET_PORT=80
 
 
 # Create data folder and Install needed libraries
@@ -115,6 +119,7 @@ WORKDIR /
 COPY Rocket.toml .
 # COPY --from=vault /web-vault ./web-vault
 COPY ./web-vault/build ./web-vault
+
 COPY --from=build /app/target/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh
@@ -123,5 +128,9 @@ COPY docker/start.sh /start.sh
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
 # Configures the startup!
+# We should be able to remove the dumb-init now with Rocket 0.5
+# But the balenalib images have some issues with there entry.sh
+# See: https://github.com/balena-io-library/base-images/issues/735
+# Lets keep using dumb-init for now, since that is working fine.
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]
