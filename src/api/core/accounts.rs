@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rocket_contrib::json::Json;
+use rocket::serde::json::Json;
 use serde_json::Value;
 
 use crate::{
@@ -34,6 +34,8 @@ pub fn routes() -> Vec<rocket::Route> {
         password_hint,
         prelogin,
         verify_password,
+        api_key,
+        rotate_api_key,
     ]
 }
 
@@ -61,11 +63,11 @@ struct KeysData {
 }
 
 #[post("/accounts/register", data = "<data>")]
-fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
+async fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     let data: RegisterData = data.into_inner().data;
     let email = data.Email.to_lowercase();
 
-    let mut user = match User::find_by_mail(&email, &conn) {
+    let mut user = match User::find_by_mail(&email, &conn).await {
         Some(user) => {
             if !user.password_hash.is_empty() {
                 if CONFIG.is_signup_allowed(&email) {
@@ -82,19 +84,16 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
                 } else {
                     err!("Registration email does not match invite email")
                 }
-            } else if Invitation::take(&email, &conn) {
-                for mut user_org in UserOrganization::find_invited_by_user(&user.uuid, &conn).iter_mut() {
+            } else if Invitation::take(&email, &conn).await {
+                for mut user_org in UserOrganization::find_invited_by_user(&user.uuid, &conn).await.iter_mut() {
                     user_org.status = UserOrgStatus::Accepted as i32;
-                    user_org.save(&conn)?;
+                    user_org.save(&conn).await?;
                 }
-
+                user
+            } else if EmergencyAccess::find_invited_by_grantee_email(&email, &conn).await.is_some() {
                 user
             } else if CONFIG.is_signup_allowed(&email) {
-                // check if it's invited by emergency contact
-                match EmergencyAccess::find_invited_by_grantee_email(&data.Email, &conn) {
-                    Some(_) => user,
-                    _ => err!("Account with this email already exists"),
-                }
+                err!("Account with this email already exists")
             } else {
                 err!("Registration not allowed or user already exists")
             }
@@ -103,7 +102,7 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
             // Order is important here; the invitation check must come first
             // because the vaultwarden admin can invite anyone, regardless
             // of other signup restrictions.
-            if Invitation::take(&email, &conn) || CONFIG.is_signup_allowed(&email) {
+            if Invitation::take(&email, &conn).await || CONFIG.is_signup_allowed(&email) {
                 User::new(email.clone())
             } else {
                 err!("Registration not allowed or user already exists")
@@ -112,7 +111,7 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     };
 
     // Make sure we don't leave a lingering invitation.
-    Invitation::take(&email, &conn);
+    Invitation::take(&email, &conn).await;
 
     if let Some(client_kdf_iter) = data.KdfIterations {
         user.client_kdf_iter = client_kdf_iter;
@@ -151,12 +150,12 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
         }
     }
 
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[get("/accounts/profile")]
-fn profile(headers: Headers, conn: DbConn) -> Json<Value> {
-    Json(headers.user.to_json(&conn))
+async fn profile(headers: Headers, conn: DbConn) -> Json<Value> {
+    Json(headers.user.to_json(&conn).await)
 }
 
 #[derive(Deserialize, Debug)]
@@ -169,12 +168,12 @@ struct ProfileData {
 }
 
 #[put("/accounts/profile", data = "<data>")]
-fn put_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -> JsonResult {
-    post_profile(data, headers, conn)
+async fn put_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -> JsonResult {
+    post_profile(data, headers, conn).await
 }
 
 #[post("/accounts/profile", data = "<data>")]
-fn post_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn post_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: ProfileData = data.into_inner().data;
 
     let mut user = headers.user;
@@ -184,13 +183,13 @@ fn post_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -
         Some(ref h) if h.is_empty() => None,
         _ => data.MasterPasswordHint,
     };
-    user.save(&conn)?;
-    Ok(Json(user.to_json(&conn)))
+    user.save(&conn).await?;
+    Ok(Json(user.to_json(&conn).await))
 }
 
 #[get("/users/<uuid>/public-key")]
-fn get_public_keys(uuid: String, _headers: Headers, conn: DbConn) -> JsonResult {
-    let user = match User::find_by_uuid(&uuid, &conn) {
+async fn get_public_keys(uuid: String, _headers: Headers, conn: DbConn) -> JsonResult {
+    let user = match User::find_by_uuid(&uuid, &conn).await {
         Some(user) => user,
         None => err!("User doesn't exist"),
     };
@@ -203,7 +202,7 @@ fn get_public_keys(uuid: String, _headers: Headers, conn: DbConn) -> JsonResult 
 }
 
 #[post("/accounts/keys", data = "<data>")]
-fn post_keys(data: JsonUpcase<KeysData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn post_keys(data: JsonUpcase<KeysData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: KeysData = data.into_inner().data;
 
     let mut user = headers.user;
@@ -211,7 +210,7 @@ fn post_keys(data: JsonUpcase<KeysData>, headers: Headers, conn: DbConn) -> Json
     user.private_key = Some(data.EncryptedPrivateKey);
     user.public_key = Some(data.PublicKey);
 
-    user.save(&conn)?;
+    user.save(&conn).await?;
 
     Ok(Json(json!({
         "PrivateKey": user.private_key,
@@ -229,7 +228,7 @@ struct ChangePassData {
 }
 
 #[post("/accounts/password", data = "<data>")]
-fn post_password(data: JsonUpcase<ChangePassData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_password(data: JsonUpcase<ChangePassData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: ChangePassData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -242,7 +241,7 @@ fn post_password(data: JsonUpcase<ChangePassData>, headers: Headers, conn: DbCon
         Some(vec![String::from("post_rotatekey"), String::from("get_contacts"), String::from("get_public_keys")]),
     );
     user.akey = data.Key;
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[derive(Deserialize)]
@@ -257,7 +256,7 @@ struct ChangeKdfData {
 }
 
 #[post("/accounts/kdf", data = "<data>")]
-fn post_kdf(data: JsonUpcase<ChangeKdfData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_kdf(data: JsonUpcase<ChangeKdfData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: ChangeKdfData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -269,7 +268,7 @@ fn post_kdf(data: JsonUpcase<ChangeKdfData>, headers: Headers, conn: DbConn) -> 
     user.client_kdf_type = data.Kdf;
     user.set_password(&data.NewMasterPasswordHash, None);
     user.akey = data.Key;
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[derive(Deserialize)]
@@ -292,7 +291,7 @@ struct KeyData {
 }
 
 #[post("/accounts/key", data = "<data>")]
-fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+async fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let data: KeyData = data.into_inner().data;
 
     if !headers.user.check_valid_password(&data.MasterPasswordHash) {
@@ -303,7 +302,7 @@ fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt:
 
     // Update folder data
     for folder_data in data.Folders {
-        let mut saved_folder = match Folder::find_by_uuid(&folder_data.Id, &conn) {
+        let mut saved_folder = match Folder::find_by_uuid(&folder_data.Id, &conn).await {
             Some(folder) => folder,
             None => err!("Folder doesn't exist"),
         };
@@ -313,14 +312,14 @@ fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt:
         }
 
         saved_folder.name = folder_data.Name;
-        saved_folder.save(&conn)?
+        saved_folder.save(&conn).await?
     }
 
     // Update cipher data
     use super::ciphers::update_cipher_from_data;
 
     for cipher_data in data.Ciphers {
-        let mut saved_cipher = match Cipher::find_by_uuid(cipher_data.Id.as_ref().unwrap(), &conn) {
+        let mut saved_cipher = match Cipher::find_by_uuid(cipher_data.Id.as_ref().unwrap(), &conn).await {
             Some(cipher) => cipher,
             None => err!("Cipher doesn't exist"),
         };
@@ -331,7 +330,7 @@ fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt:
 
         // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
         // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
-        update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, false, &conn, &nt, UpdateType::None)?
+        update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, false, &conn, &nt, UpdateType::None).await?
     }
 
     // Update user data
@@ -341,11 +340,11 @@ fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, conn: DbConn, nt:
     user.private_key = Some(data.PrivateKey);
     user.reset_security_stamp();
 
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[post("/accounts/security-stamp", data = "<data>")]
-fn post_sstamp(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_sstamp(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: PasswordData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -353,9 +352,9 @@ fn post_sstamp(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -
         err!("Invalid password")
     }
 
-    Device::delete_all_by_user(&user.uuid, &conn)?;
+    Device::delete_all_by_user(&user.uuid, &conn).await?;
     user.reset_security_stamp();
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[derive(Deserialize)]
@@ -366,7 +365,7 @@ struct EmailTokenData {
 }
 
 #[post("/accounts/email-token", data = "<data>")]
-fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: EmailTokenData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -374,7 +373,7 @@ fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: Db
         err!("Invalid password")
     }
 
-    if User::find_by_mail(&data.NewEmail, &conn).is_some() {
+    if User::find_by_mail(&data.NewEmail, &conn).await.is_some() {
         err!("Email already in use");
     }
 
@@ -382,7 +381,7 @@ fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: Db
         err!("Email domain not allowed");
     }
 
-    let token = crypto::generate_token(6)?;
+    let token = crypto::generate_email_token(6);
 
     if CONFIG.mail_enabled() {
         if let Err(e) = mail::send_change_email(&data.NewEmail, &token) {
@@ -392,7 +391,7 @@ fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: Db
 
     user.email_new = Some(data.NewEmail);
     user.email_new_token = Some(token);
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[derive(Deserialize)]
@@ -407,7 +406,7 @@ struct ChangeEmailData {
 }
 
 #[post("/accounts/email", data = "<data>")]
-fn post_email(data: JsonUpcase<ChangeEmailData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_email(data: JsonUpcase<ChangeEmailData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: ChangeEmailData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -415,7 +414,7 @@ fn post_email(data: JsonUpcase<ChangeEmailData>, headers: Headers, conn: DbConn)
         err!("Invalid password")
     }
 
-    if User::find_by_mail(&data.NewEmail, &conn).is_some() {
+    if User::find_by_mail(&data.NewEmail, &conn).await.is_some() {
         err!("Email already in use");
     }
 
@@ -450,7 +449,7 @@ fn post_email(data: JsonUpcase<ChangeEmailData>, headers: Headers, conn: DbConn)
     user.set_password(&data.NewMasterPasswordHash, None);
     user.akey = data.Key;
 
-    user.save(&conn)
+    user.save(&conn).await
 }
 
 #[post("/accounts/verify-email")]
@@ -476,10 +475,10 @@ struct VerifyEmailTokenData {
 }
 
 #[post("/accounts/verify-email-token", data = "<data>")]
-fn post_verify_email_token(data: JsonUpcase<VerifyEmailTokenData>, conn: DbConn) -> EmptyResult {
+async fn post_verify_email_token(data: JsonUpcase<VerifyEmailTokenData>, conn: DbConn) -> EmptyResult {
     let data: VerifyEmailTokenData = data.into_inner().data;
 
-    let mut user = match User::find_by_uuid(&data.UserId, &conn) {
+    let mut user = match User::find_by_uuid(&data.UserId, &conn).await {
         Some(user) => user,
         None => err!("User doesn't exist"),
     };
@@ -494,7 +493,7 @@ fn post_verify_email_token(data: JsonUpcase<VerifyEmailTokenData>, conn: DbConn)
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn) {
+    if let Err(e) = user.save(&conn).await {
         error!("Error saving email verification: {:#?}", e);
     }
 
@@ -508,13 +507,11 @@ struct DeleteRecoverData {
 }
 
 #[post("/accounts/delete-recover", data = "<data>")]
-fn post_delete_recover(data: JsonUpcase<DeleteRecoverData>, conn: DbConn) -> EmptyResult {
+async fn post_delete_recover(data: JsonUpcase<DeleteRecoverData>, conn: DbConn) -> EmptyResult {
     let data: DeleteRecoverData = data.into_inner().data;
 
-    let user = User::find_by_mail(&data.Email, &conn);
-
     if CONFIG.mail_enabled() {
-        if let Some(user) = user {
+        if let Some(user) = User::find_by_mail(&data.Email, &conn).await {
             if let Err(e) = mail::send_delete_account(&user.email, &user.uuid) {
                 error!("Error sending delete account email: {:#?}", e);
             }
@@ -537,10 +534,10 @@ struct DeleteRecoverTokenData {
 }
 
 #[post("/accounts/delete-recover-token", data = "<data>")]
-fn post_delete_recover_token(data: JsonUpcase<DeleteRecoverTokenData>, conn: DbConn) -> EmptyResult {
+async fn post_delete_recover_token(data: JsonUpcase<DeleteRecoverTokenData>, conn: DbConn) -> EmptyResult {
     let data: DeleteRecoverTokenData = data.into_inner().data;
 
-    let user = match User::find_by_uuid(&data.UserId, &conn) {
+    let user = match User::find_by_uuid(&data.UserId, &conn).await {
         Some(user) => user,
         None => err!("User doesn't exist"),
     };
@@ -552,16 +549,16 @@ fn post_delete_recover_token(data: JsonUpcase<DeleteRecoverTokenData>, conn: DbC
     if claims.sub != user.uuid {
         err!("Invalid claim");
     }
-    user.delete(&conn)
+    user.delete(&conn).await
 }
 
 #[post("/accounts/delete", data = "<data>")]
-fn post_delete_account(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
-    delete_account(data, headers, conn)
+async fn post_delete_account(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
+    delete_account(data, headers, conn).await
 }
 
 #[delete("/accounts", data = "<data>")]
-fn delete_account(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn delete_account(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: PasswordData = data.into_inner().data;
     let user = headers.user;
 
@@ -569,7 +566,7 @@ fn delete_account(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn
         err!("Invalid password")
     }
 
-    user.delete(&conn)
+    user.delete(&conn).await
 }
 
 #[get("/accounts/revision-date")]
@@ -585,7 +582,7 @@ struct PasswordHintData {
 }
 
 #[post("/accounts/password-hint", data = "<data>")]
-fn password_hint(data: JsonUpcase<PasswordHintData>, conn: DbConn) -> EmptyResult {
+async fn password_hint(data: JsonUpcase<PasswordHintData>, conn: DbConn) -> EmptyResult {
     if !CONFIG.mail_enabled() && !CONFIG.show_password_hint() {
         err!("This server is not configured to provide password hints.");
     }
@@ -595,19 +592,18 @@ fn password_hint(data: JsonUpcase<PasswordHintData>, conn: DbConn) -> EmptyResul
     let data: PasswordHintData = data.into_inner().data;
     let email = &data.Email;
 
-    match User::find_by_mail(email, &conn) {
+    match User::find_by_mail(email, &conn).await {
         None => {
             // To prevent user enumeration, act as if the user exists.
             if CONFIG.mail_enabled() {
                 // There is still a timing side channel here in that the code
                 // paths that send mail take noticeably longer than ones that
                 // don't. Add a randomized sleep to mitigate this somewhat.
-                use rand::{thread_rng, Rng};
-                let mut rng = thread_rng();
-                let base = 1000;
+                use rand::{rngs::SmallRng, Rng, SeedableRng};
+                let mut rng = SmallRng::from_entropy();
                 let delta: i32 = 100;
-                let sleep_ms = (base + rng.gen_range(-delta..=delta)) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                let sleep_ms = (1_000 + rng.gen_range(-delta..=delta)) as u64;
+                tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                 Ok(())
             } else {
                 err!(NO_HINT);
@@ -629,15 +625,19 @@ fn password_hint(data: JsonUpcase<PasswordHintData>, conn: DbConn) -> EmptyResul
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
-struct PreloginData {
+pub struct PreloginData {
     Email: String,
 }
 
 #[post("/accounts/prelogin", data = "<data>")]
-fn prelogin(data: JsonUpcase<PreloginData>, conn: DbConn) -> Json<Value> {
+async fn prelogin(data: JsonUpcase<PreloginData>, conn: DbConn) -> Json<Value> {
+    _prelogin(data, conn).await
+}
+
+pub async fn _prelogin(data: JsonUpcase<PreloginData>, conn: DbConn) -> Json<Value> {
     let data: PreloginData = data.into_inner().data;
 
-    let (kdf_type, kdf_iter) = match User::find_by_mail(&data.Email, &conn) {
+    let (kdf_type, kdf_iter) = match User::find_by_mail(&data.Email, &conn).await {
         Some(user) => (user.client_kdf_type, user.client_kdf_iter),
         None => (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT),
     };
@@ -647,15 +647,17 @@ fn prelogin(data: JsonUpcase<PreloginData>, conn: DbConn) -> Json<Value> {
         "KdfIterations": kdf_iter
     }))
 }
+
+// https://github.com/bitwarden/server/blob/master/src/Api/Models/Request/Accounts/SecretVerificationRequestModel.cs
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
-struct VerifyPasswordData {
+struct SecretVerificationRequest {
     MasterPasswordHash: String,
 }
 
 #[post("/accounts/verify-password", data = "<data>")]
-fn verify_password(data: JsonUpcase<VerifyPasswordData>, headers: Headers) -> EmptyResult {
-    let data: VerifyPasswordData = data.into_inner().data;
+fn verify_password(data: JsonUpcase<SecretVerificationRequest>, headers: Headers) -> EmptyResult {
+    let data: SecretVerificationRequest = data.into_inner().data;
     let user = headers.user;
 
     if !user.check_valid_password(&data.MasterPasswordHash) {
@@ -663,4 +665,38 @@ fn verify_password(data: JsonUpcase<VerifyPasswordData>, headers: Headers) -> Em
     }
 
     Ok(())
+}
+
+async fn _api_key(
+    data: JsonUpcase<SecretVerificationRequest>,
+    rotate: bool,
+    headers: Headers,
+    conn: DbConn,
+) -> JsonResult {
+    let data: SecretVerificationRequest = data.into_inner().data;
+    let mut user = headers.user;
+
+    if !user.check_valid_password(&data.MasterPasswordHash) {
+        err!("Invalid password")
+    }
+
+    if rotate || user.api_key.is_none() {
+        user.api_key = Some(crypto::generate_api_key());
+        user.save(&conn).await.expect("Error saving API key");
+    }
+
+    Ok(Json(json!({
+      "ApiKey": user.api_key,
+      "Object": "apiKey",
+    })))
+}
+
+#[post("/accounts/api-key", data = "<data>")]
+async fn api_key(data: JsonUpcase<SecretVerificationRequest>, headers: Headers, conn: DbConn) -> JsonResult {
+    _api_key(data, false, headers, conn).await
+}
+
+#[post("/accounts/rotate-api-key", data = "<data>")]
+async fn rotate_api_key(data: JsonUpcase<SecretVerificationRequest>, headers: Headers, conn: DbConn) -> JsonResult {
+    _api_key(data, true, headers, conn).await
 }

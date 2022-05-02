@@ -3,31 +3,39 @@
 # This file was generated using a Jinja2 template.
 # Please make your changes in `Dockerfile.j2` and then `make` the individual Dockerfiles.
 
-{% set build_stage_base_image = "rust:1.55-buster" %}
+{% set build_stage_base_image = "rust:1.59-bullseye" %}
 {% if "alpine" in target_file %}
 {%   if "amd64" in target_file %}
-{%     set build_stage_base_image = "clux/muslrust:nightly-2021-10-23" %}
-{%     set runtime_stage_base_image = "alpine:3.14" %}
+{%     set build_stage_base_image = "blackdex/rust-musl:x86_64-musl-stable" %}
+{%     set runtime_stage_base_image = "alpine:3.15" %}
 {%     set package_arch_target = "x86_64-unknown-linux-musl" %}
 {%   elif "armv7" in target_file %}
-{%     set build_stage_base_image = "messense/rust-musl-cross:armv7-musleabihf" %}
-{%     set runtime_stage_base_image = "balenalib/armv7hf-alpine:3.14" %}
+{%     set build_stage_base_image = "blackdex/rust-musl:armv7-musleabihf-stable" %}
+{%     set runtime_stage_base_image = "balenalib/armv7hf-alpine:3.15" %}
 {%     set package_arch_target = "armv7-unknown-linux-musleabihf" %}
+{%   elif "armv6" in target_file %}
+{%     set build_stage_base_image = "blackdex/rust-musl:arm-musleabi-stable" %}
+{%     set runtime_stage_base_image = "balenalib/rpi-alpine:3.15" %}
+{%     set package_arch_target = "arm-unknown-linux-musleabi" %}
+{%   elif "arm64" in target_file %}
+{%     set build_stage_base_image = "blackdex/rust-musl:aarch64-musl-stable" %}
+{%     set runtime_stage_base_image = "balenalib/aarch64-alpine:3.15" %}
+{%     set package_arch_target = "aarch64-unknown-linux-musl" %}
 {%   endif %}
 {% elif "amd64" in target_file %}
-{%   set runtime_stage_base_image = "debian:buster-slim" %}
+{%   set runtime_stage_base_image = "debian:bullseye-slim" %}
 {% elif "arm64" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/aarch64-debian:buster" %}
+{%   set runtime_stage_base_image = "balenalib/aarch64-debian:bullseye" %}
 {%   set package_arch_name = "arm64" %}
 {%   set package_arch_target = "aarch64-unknown-linux-gnu" %}
 {%   set package_cross_compiler = "aarch64-linux-gnu" %}
 {% elif "armv6" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/rpi-debian:buster" %}
+{%   set runtime_stage_base_image = "balenalib/rpi-debian:bullseye" %}
 {%   set package_arch_name = "armel" %}
 {%   set package_arch_target = "arm-unknown-linux-gnueabi" %}
 {%   set package_cross_compiler = "arm-linux-gnueabi" %}
 {% elif "armv7" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/armv7hf-debian:buster" %}
+{%   set runtime_stage_base_image = "balenalib/armv7hf-debian:bullseye" %}
 {%   set package_arch_name = "armhf" %}
 {%   set package_arch_target = "armv7-unknown-linux-gnueabihf" %}
 {%   set package_cross_compiler = "arm-linux-gnueabihf" %}
@@ -51,8 +59,8 @@
 # 	https://docs.docker.com/develop/develop-images/multistage-build/
 # 	https://whitfin.io/speeding-up-rust-docker-builds/
 ####################### VAULT BUILD IMAGE  #######################
-{% set vault_version = "2.24.1" %}
-{% set vault_image_digest = "sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b" %}
+{% set vault_version = "2.28.0" %}
+{% set vault_image_digest = "sha256:ad3b47c152206f25f2d2b70a93e68650a90d5c8105b894814f9bc7599517a603" %}
 # The web-vault digest specifies a particular web-vault build on Docker Hub.
 # Using the digest instead of the tag name provides better security,
 # as the digest of an image is immutable, whereas a tag name can later
@@ -75,22 +83,7 @@ FROM vaultwarden/web-vault@{{ vault_image_digest }} as vault
 ########################## BUILD IMAGE  ##########################
 FROM {{ build_stage_base_image }} as build
 
-{% if "alpine" in target_file %}
-{%   if "amd64" in target_file %}
-# Alpine-based AMD64 (musl) does not support mysql/mariadb during compile time.
-ARG DB=sqlite,postgresql
-{%     set features = "sqlite,postgresql" %}
-{%   else %}
-# Alpine-based ARM (musl) only supports sqlite during compile time.
-# We now also need to add vendored_openssl, because the current base image we use to build has OpenSSL removed.
-ARG DB=sqlite,vendored_openssl
-{%     set features = "sqlite" %}
-{%   endif %}
-{% else %}
-# Debian-based builds support multidb
-ARG DB=sqlite,mysql,postgresql
-{%   set features = "sqlite,mysql,postgresql" %}
-{% endif %}
+
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -112,46 +105,26 @@ RUN {{ mount_rust_cache -}} mkdir -pv "${CARGO_HOME}" \
     && rustup set profile minimal
 
 {% if "alpine" in target_file %}
-ENV RUSTFLAGS='-C link-arg=-s'
-{%   if "armv7" in target_file %}
-{#- https://gcc.gnu.org/onlinedocs/gcc/ARM-Options.html -#}
-ENV CFLAGS_armv7_unknown_linux_musleabihf="-mfpu=vfpv3-d16"
+{%   if "armv6" in target_file %}
+# To be able to build the armv6 image with mimalloc we need to specifically specify the libatomic.a file location
+ENV RUSTFLAGS='-Clink-arg=/usr/local/musl/{{ package_arch_target }}/lib/libatomic.a'
 {%   endif %}
 {% elif "arm" in target_file %}
-# NOTE: Any apt-get/dpkg after this stage will fail because of broken dependencies.
-# For Diesel-RS migrations_macros to compile with MySQL/MariaDB we need to do some magic.
-# We at least need libmariadb3:amd64 installed for the x86_64 version of libmariadb.so (client)
-# We also need the libmariadb-dev-compat:amd64 but it can not be installed together with the {{ package_arch_prefix }} version.
-# What we can do is a force install, because nothing important is overlapping each other.
 #
 # Install required build libs for {{ package_arch_name }} architecture.
-# To compile both mysql and postgresql we need some extra packages for both host arch and target arch
-RUN sed 's/^deb/deb-src/' /etc/apt/sources.list > /etc/apt/sources.list.d/deb-src.list \
-    && dpkg --add-architecture {{ package_arch_name }} \
+# hadolint ignore=DL3059
+RUN dpkg --add-architecture {{ package_arch_name }} \
     && apt-get update \
     && apt-get install -y \
         --no-install-recommends \
         libssl-dev{{ package_arch_prefix }} \
         libc6-dev{{ package_arch_prefix }} \
         libpq5{{ package_arch_prefix }} \
-        libpq-dev \
-        libmariadb3:amd64 \
+        libpq-dev{{ package_arch_prefix }} \
+        libmariadb3{{ package_arch_prefix }} \
         libmariadb-dev{{ package_arch_prefix }} \
         libmariadb-dev-compat{{ package_arch_prefix }} \
         gcc-{{ package_cross_compiler }} \
-    #
-    # Manual install libmariadb-dev-compat:amd64 ( After this broken dependencies will break apt )
-    && apt-get download libmariadb-dev-compat:amd64 \
-    && dpkg --force-all -i ./libmariadb-dev-compat*.deb \
-    && rm -rvf ./libmariadb-dev-compat*.deb \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    #
-    # For Diesel-RS migrations_macros to compile with PostgreSQL we need to do some magic.
-    # The libpq5{{ package_arch_prefix }} package seems to not provide a symlink to libpq.so.5 with the name libpq.so.
-    # This is only provided by the libpq-dev package which can't be installed for both arch at the same time.
-    # Without this specific file the ld command will fail and compilation fails with it.
-    && ln -sfnr /usr/lib/{{ package_cross_compiler }}/libpq.so.5 /usr/lib/{{ package_cross_compiler }}/libpq.so \
     #
     # Make sure cargo has the right target config
     && echo '[target.{{ package_arch_target }}]' >> "${CARGO_HOME}/config" \
@@ -159,10 +132,10 @@ RUN sed 's/^deb/deb-src/' /etc/apt/sources.list > /etc/apt/sources.list.d/deb-sr
     && echo 'rustflags = ["-L/usr/lib/{{ package_cross_compiler }}"]' >> "${CARGO_HOME}/config"
 
 # Set arm specific environment values
-ENV CC_{{ package_arch_target | replace("-", "_") }}="/usr/bin/{{ package_cross_compiler }}-gcc"
-ENV CROSS_COMPILE="1"
-ENV OPENSSL_INCLUDE_DIR="/usr/include/{{ package_cross_compiler }}"
-ENV OPENSSL_LIB_DIR="/usr/lib/{{ package_cross_compiler }}"
+ENV CC_{{ package_arch_target | replace("-", "_") }}="/usr/bin/{{ package_cross_compiler }}-gcc" \
+    CROSS_COMPILE="1" \
+    OPENSSL_INCLUDE_DIR="/usr/include/{{ package_cross_compiler }}" \
+    OPENSSL_LIB_DIR="/usr/lib/{{ package_cross_compiler }}"
 
 {% elif "amd64" in target_file %}
 # Install DB packages
@@ -188,6 +161,14 @@ COPY ./build.rs ./build.rs
 RUN {{ mount_rust_cache -}} rustup target add {{ package_arch_target }}
 {% endif %}
 
+# Configure the DB ARG as late as possible to not invalidate the cached layers above
+{% if "alpine" in target_file %}
+# Enable MiMalloc to improve performance on Alpine builds
+ARG DB=sqlite,mysql,postgresql,enable_mimalloc
+{% else %}
+ARG DB=sqlite,mysql,postgresql
+{% endif %}
+
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
@@ -203,25 +184,21 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
-RUN {{ mount_rust_cache -}} cargo build --features ${DB} --release{{ package_arch_target_param }}
-{% if "alpine" in target_file %}
-{%   if "armv7" in target_file %}
 # hadolint ignore=DL3059
-RUN musl-strip target/{{ package_arch_target }}/release/vaultwarden
-{%   endif %}
-{% endif %}
+RUN {{ mount_rust_cache -}} cargo build --features ${DB} --release{{ package_arch_target_param }}
 
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
 FROM {{ runtime_stage_base_image }}
 
-ENV ROCKET_ENV "staging"
-ENV ROCKET_PORT=80
-ENV ROCKET_WORKERS=10
-{% if "alpine" in runtime_stage_base_image %}
-ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV ROCKET_PROFILE="release" \
+    ROCKET_ADDRESS=0.0.0.0 \
+    ROCKET_PORT=80
+{%- if "alpine" in runtime_stage_base_image %} \
+    SSL_CERT_DIR=/etc/ssl/certs
 {% endif %}
+
 
 {% if "amd64" not in target_file %}
 # hadolint ignore=DL3059
@@ -236,12 +213,6 @@ RUN mkdir /data \
         tzdata \
         curl \
         dumb-init \
-{%   if "mysql" in features %}
-        mariadb-connector-c \
-{%   endif %}
-{%   if "postgresql" in features %}
-        postgresql-libs \
-{%   endif %}
         ca-certificates
 {% else %}
     && apt-get update && apt-get install -y \
@@ -268,7 +239,6 @@ EXPOSE 3012
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
 WORKDIR /
-COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
 {% if package_arch_target is defined %}
 COPY --from=build /app/target/{{ package_arch_target }}/release/vaultwarden .
@@ -282,5 +252,9 @@ COPY docker/start.sh /start.sh
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
 # Configures the startup!
+# We should be able to remove the dumb-init now with Rocket 0.5
+# But the balenalib images have some issues with there entry.sh
+# See: https://github.com/balena-io-library/base-images/issues/735
+# Lets keep using dumb-init for now, since that is working fine.
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]
