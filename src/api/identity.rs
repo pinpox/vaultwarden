@@ -549,7 +549,10 @@ fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
 #[allow(unreachable_code)]
 fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
     let empty_result = json!({});
+
+    // TODO: fix panic on failig to retrive (no unwrap on null)
     let organization = Organization::find_by_identifier(&domainHint, &conn).unwrap();
+
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn);
     match sso_config {
         Some(sso_config) => {
