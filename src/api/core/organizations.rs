@@ -325,12 +325,10 @@ async fn post_organization(
 
 #[get("/organizations/<org_id>/sso")]
 async fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) -> JsonResult {
-    print!("RUNNING GET SSO\n");
     let test = match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => Ok(Json(sso_config.to_json())),
         None => err!("Can't find organization sso config"),
     };
-    print!("RUNNING GET SSO2\n");
     // print!("{:?}", test);
     test
 }
@@ -342,7 +340,6 @@ async fn put_organization_sso(
     data: JsonUpcase<OrganizationSsoUpdateData>,
     conn: DbConn,
 ) -> JsonResult {
-    print!("RUNNING POST SSO\n");
 
     // let p: OrganizationSsoUpdateData = data;
 
