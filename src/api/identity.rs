@@ -1,10 +1,11 @@
 use chrono::Utc;
+use jsonwebtoken::DecodingKey;
 use num_traits::FromPrimitive;
 use rocket::serde::json::Json;
 use rocket::{
+    form::{Form, FromForm},
     http::Status,
     response::Redirect,
-    form::{Form, FormItems, FromForm},
     Route,
 };
 use serde_json::Value;
@@ -59,7 +60,7 @@ async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResul
             _check_is_some(&data.org_identifier, "org_identifier cannot be blank")?;
             _check_is_some(&data.device_identifier, "device identifier cannot be blank")?;
 
-            _authorization_login(data, conn, &ip)
+            _authorization_login(data, conn, &ip).await
         }
         t => err!("Invalid type", t),
     }
@@ -104,40 +105,51 @@ struct TokenPayload {
     nonce: String,
 }
 
-fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
+async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
     let org_identifier = data.org_identifier.as_ref().unwrap();
     let code = data.code.as_ref().unwrap();
-    let organization = Organization::find_by_identifier(org_identifier, &conn).unwrap();
-    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).unwrap();
+    let organization = Organization::find_by_identifier(org_identifier, &conn).await.unwrap();
+    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
 
     let (access_token, refresh_token) = match get_auth_code_access_token(&code, &sso_config) {
         Ok((access_token, refresh_token)) => (access_token, refresh_token),
         Err(err) => err!(err),
     };
 
-    let token = jsonwebtoken::dangerous_insecure_decode::<TokenPayload>(access_token.as_str()).unwrap().claims;
+    // https://github.com/Keats/jsonwebtoken/issues/236#issuecomment-1093039195
+    // let token = jsonwebtoken::decode::<TokenPayload>(access_token.as_str()).unwrap().claims;
+    let mut validation = jsonwebtoken::Validation::default();
+    validation.insecure_disable_signature_validation();
+
+    let token =
+        jsonwebtoken::decode::<TokenPayload>(access_token.as_str(), &DecodingKey::from_secret(&[]), &validation)
+            .unwrap()
+            .claims;
+
     // let expiry = token.exp;
     // let user_email = token.email;
     // let now = Utc::now().naive_utc();
     let nonce = token.nonce;
 
-    match SsoNonce::find_by_org_and_nonce(&organization.uuid, &nonce, &conn) {
+    match SsoNonce::find_by_org_and_nonce(&organization.uuid, &nonce, &conn).await {
         Some(sso_nonce) => {
-            match sso_nonce.delete(&conn) {
+            match sso_nonce.delete(&conn).await {
                 Ok(_) => {
                     let expiry = token.exp;
                     let user_email = token.email;
                     let now = Utc::now().naive_utc();
 
                     // COMMON
-                    let user = User::find_by_mail(&user_email, &conn).unwrap();
+                    let user = User::find_by_mail(&user_email, &conn).await.unwrap();
 
-                    let (mut device, new_device) = get_device(&data, &conn, &user);
+                    let (mut device, new_device) = get_device(&data, &conn, &user).await;
 
-                    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, &conn)?;
+                    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, &conn).await?;
 
                     if CONFIG.mail_enabled() && new_device {
-                        if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name) {
+                        if let Err(e) =
+                            mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name)
+                        {
                             error!("Error sending new device email: {:#?}", e);
 
                             if CONFIG.require_device_email() {
@@ -147,7 +159,7 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
                     }
 
                     device.refresh_token = refresh_token.clone();
-                    device.save(&conn)?;
+                    device.save(&conn).await?;
 
                     let mut result = json!({
                         "access_token": access_token,
@@ -169,10 +181,10 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
                     }
 
                     Ok(Json(result))
-                },
+                }
                 Err(_) => err!("Failed to delete nonce"),
             }
-        },
+        }
         None => {
             err!("Invalid nonce")
         }
@@ -180,7 +192,6 @@ fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonR
 }
 
 async fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
-
     // Validate scope
     let scope = data.scope.as_ref().unwrap();
     if scope != "api offline_access" {
@@ -210,7 +221,7 @@ async fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> Json
     }
 
     // Check if org policy prevents password login
-    let user_orgs = UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::RequireSso, &conn);
+    let user_orgs = UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::RequireSso, &conn).await;
     if user_orgs.len() >= 1 && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
         // if requires SSO is active, user is in exactly one org by policy rules
         // policy only applies to "non-owner/non-admin" members
@@ -594,38 +605,38 @@ struct ConnectData {
     org_identifier: Option<String>,
 }
 
-impl<'f> FromForm<'f> for ConnectData {
-    type Error = String;
+// impl<'f> FromForm<'f> for ConnectData {
+// type Error = String;
 
-    fn from_form(items: &mut FormItems<'f>, _strict: bool) -> Result<Self, Self::Error> {
-        let mut form = Self::default();
-        for item in items {
-            let (key, value) = item.key_value_decoded();
-            let mut normalized_key = key.to_lowercase();
-            normalized_key.retain(|c| c != '_'); // Remove '_'
+// fn from_form(items: &mut FormItems<'f>, _strict: bool) -> Result<Self, Self::Error> {
+//     let mut form = Self::default();
+//     for item in items {
+//         let (key, value) = item.key_value_decoded();
+//         let mut normalized_key = key.to_lowercase();
+//         normalized_key.retain(|c| c != '_'); // Remove '_'
 
-            match normalized_key.as_ref() {
-                "granttype" => form.grant_type = value,
-                "refreshtoken" => form.refresh_token = Some(value),
-                "clientid" => form.client_id = Some(value),
-                "password" => form.password = Some(value),
-                "scope" => form.scope = Some(value),
-                "username" => form.username = Some(value),
-                "deviceidentifier" => form.device_identifier = Some(value),
-                "devicename" => form.device_name = Some(value),
-                "devicetype" => form.device_type = Some(value),
-                "devicepushtoken" => form.device_push_token = Some(value),
-                "twofactorprovider" => form.two_factor_provider = value.parse().ok(),
-                "twofactortoken" => form.two_factor_token = Some(value),
-                "twofactorremember" => form.two_factor_remember = value.parse().ok(),
-                "code" => form.code = Some(value),
-                "orgidentifier" => form.org_identifier = Some(value),
-                key => warn!("Detected unexpected parameter during login: {}", key),
-            }
-        }
-        Ok(form)
-    }
-}
+//         match normalized_key.as_ref() {
+//             "granttype" => form.grant_type = value,
+//             "refreshtoken" => form.refresh_token = Some(value),
+//             "clientid" => form.client_id = Some(value),
+//             "password" => form.password = Some(value),
+//             "scope" => form.scope = Some(value),
+//             "username" => form.username = Some(value),
+//             "deviceidentifier" => form.device_identifier = Some(value),
+//             "devicename" => form.device_name = Some(value),
+//             "devicetype" => form.device_type = Some(value),
+//             "devicepushtoken" => form.device_push_token = Some(value),
+//             "twofactorprovider" => form.two_factor_provider = value.parse().ok(),
+//             "twofactortoken" => form.two_factor_token = Some(value),
+//             "twofactorremember" => form.two_factor_remember = value.parse().ok(),
+//             "code" => form.code = Some(value),
+//             "orgidentifier" => form.org_identifier = Some(value),
+//             key => warn!("Detected unexpected parameter during login: {}", key),
+//         }
+//     }
+//     Ok(form)
+// }
+// }
 
 fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
     if value.is_none() {
@@ -639,27 +650,25 @@ fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
 // The compiler warns about unreachable code here. But I've tested it, and it seems to work
 // as expected. All errors appear to be reachable, as is the Ok response.
 #[allow(unreachable_code)]
-fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
+async fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
     let empty_result = json!({});
 
     // TODO: fix panic on failig to retrive (no unwrap on null)
-    let organization = Organization::find_by_identifier(&domainHint, &conn).unwrap();
+    let organization = Organization::find_by_identifier(&domainHint, &conn).await.unwrap();
 
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn);
-    match sso_config {
+    match sso_config.await {
         Some(sso_config) => {
             if !sso_config.use_sso {
                 return err_code!("SSO Not allowed for organization", Status::BadRequest.code);
             }
-            if sso_config.authority.is_none()
-                || sso_config.client_id.is_none()
-                || sso_config.client_secret.is_none() {
+            if sso_config.authority.is_none() || sso_config.client_id.is_none() || sso_config.client_secret.is_none() {
                 return err_code!("Organization is incorrectly configured for SSO", Status::BadRequest.code);
             }
-        },
+        }
         None => {
             return err_code!("Unable to find sso config", Status::BadRequest.code);
-        },
+        }
     }
 
     if domainHint == "" {
@@ -669,45 +678,34 @@ fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
     Ok(Json(empty_result))
 }
 
-use openidconnect::core::{
-    CoreProviderMetadata, CoreClient,
-    CoreResponseType,
-};
+use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::reqwest::http_client;
 use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret,
-    CsrfToken, IssuerUrl, Nonce, RedirectUrl,
-    Scope, OAuth2TokenResponse,
+    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
+    RedirectUrl, Scope,
 };
 
-fn get_client_from_sso_config (sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
+fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
     let redirect = sso_config.callback_path.to_string();
     let client_id = ClientId::new(sso_config.client_id.as_ref().unwrap().to_string());
     let client_secret = ClientSecret::new(sso_config.client_secret.as_ref().unwrap().to_string());
-    let issuer_url = IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
+    let issuer_url =
+        IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
     let provider_metadata = match CoreProviderMetadata::discover(&issuer_url, http_client) {
         Ok(metadata) => metadata,
         Err(_err) => {
             return Err("Failed to discover OpenID provider");
-        },
+        }
     };
-    let client = CoreClient::from_provider_metadata(
-        provider_metadata,
-        client_id,
-        Some(client_secret),
-    )
-    .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
+    let client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret))
+        .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
     return Ok(client);
 }
 
 #[get("/connect/authorize?<domain_hint>&<state>")]
-fn authorize(
-    domain_hint: String,
-    state: String,
-    conn: DbConn,
-) -> ApiResult<Redirect> {
-    let organization = Organization::find_by_identifier(&domain_hint, &conn).unwrap();
-    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).unwrap();
+async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResult<Redirect> {
+    let organization = Organization::find_by_identifier(&domain_hint, &conn).await.unwrap();
+    let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
     match get_client_from_sso_config(&sso_config) {
         Ok(client) => {
             let (mut authorize_url, _csrf_state, nonce) = client
@@ -721,7 +719,7 @@ fn authorize(
                 .url();
 
             let sso_nonce = SsoNonce::new(organization.uuid, nonce.secret().to_string());
-            sso_nonce.save(&conn)?;
+            sso_nonce.save(&conn).await?;
 
             // it seems impossible to set the state going in dynamically (requires static lifetime string)
             // so I change it after the fact
@@ -737,28 +735,22 @@ fn authorize(
             authorize_url.set_query(Some(full_query.as_str()));
 
             return Ok(Redirect::to(authorize_url.to_string()));
-        },
+        }
         Err(_err) => err!("Unable to find client from identifier"),
     }
 }
 
-fn get_auth_code_access_token (
-    code: &str,
-    sso_config: &SsoConfig,
-) -> Result<(String, String), &'static str> {
+fn get_auth_code_access_token(code: &str, sso_config: &SsoConfig) -> Result<(String, String), &'static str> {
     let oidc_code = AuthorizationCode::new(String::from(code));
     match get_client_from_sso_config(sso_config) {
-        Ok(client) => {
-            match client.exchange_code(oidc_code).request(http_client) {
-                Ok(token_response) => {
-                    let access_token = token_response.access_token().secret().to_string();
-                    let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
+        Ok(client) => match client.exchange_code(oidc_code).request(http_client) {
+            Ok(token_response) => {
+                let access_token = token_response.access_token().secret().to_string();
+                let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
 
-                    Ok((access_token, refresh_token))
-                },
-                Err(_err) => Err("Failed to contact token endpoint"),
+                Ok((access_token, refresh_token))
             }
-
+            Err(_err) => Err("Failed to contact token endpoint"),
         },
         Err(_err) => Err("unable to find client"),
     }

@@ -2,7 +2,6 @@ use num_traits::FromPrimitive;
 use rocket::serde::json::Json;
 use rocket::Route;
 use serde_json::Value;
-use serde_json::Number;
 
 use crate::{
     api::{EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType},
@@ -228,6 +227,7 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, conn: 
 
     org.save(&conn).await?;
     user_org.save(&conn).await?;
+    // sso_config.save(&conn).await?;
     sso_config.save(&conn).await?;
     collection.save(&conn).await?;
 
@@ -324,9 +324,9 @@ async fn post_organization(
 }
 
 #[get("/organizations/<org_id>/sso")]
-fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) -> JsonResult {
+async fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) -> JsonResult {
     print!("RUNNING GET SSO\n");
-    let test = match SsoConfig::find_by_org(&org_id, &conn) {
+    let test = match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => Ok(Json(sso_config.to_json())),
         None => err!("Can't find organization sso config"),
     };
@@ -336,7 +336,7 @@ fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) ->
 }
 
 #[post("/organizations/<org_id>/sso", data = "<data>")]
-fn put_organization_sso(
+async fn put_organization_sso(
     org_id: String,
     _headers: OwnerHeaders,
     data: JsonUpcase<OrganizationSsoUpdateData>,
@@ -424,7 +424,7 @@ fn put_organization_sso(
     // print!("TEST3: {:?}", data2.Data.Authority);
     // print!("TEST4: {:?}", data2.Data.SsoOrganizationData);
 
-    let mut sso_config = match SsoConfig::find_by_org(&org_id, &conn) {
+    let mut sso_config = match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => sso_config,
         None => {
             let sso_config = SsoConfig::new(org_id);
@@ -443,7 +443,7 @@ fn put_organization_sso(
     sso_config.client_secret = d.ClientSecret;
 
 
-    sso_config.save(&conn)?;
+    sso_config.save(&conn).await?;
     Ok(Json(sso_config.to_json()))
 }
 

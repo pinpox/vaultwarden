@@ -52,7 +52,7 @@ impl SsoConfig {
 
 /// Database methods
 impl SsoConfig {
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(sso_config::table)
@@ -84,7 +84,7 @@ impl SsoConfig {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(sso_config::table.filter(sso_config::uuid.eq(self.uuid)))
                 .execute(conn)
@@ -92,7 +92,7 @@ impl SsoConfig {
         }}
     }
 
-    pub fn find_by_org(org_uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_org(org_uuid: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             sso_config::table
                 .filter(sso_config::org_uuid.eq(org_uuid))

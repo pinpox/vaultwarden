@@ -29,7 +29,7 @@ impl SsoNonce {
 
 /// Database methods
 impl SsoNonce {
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 diesel::replace_into(sso_nonce::table)
@@ -50,7 +50,7 @@ impl SsoNonce {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(sso_nonce::table.filter(sso_nonce::uuid.eq(self.uuid)))
                 .execute(conn)
@@ -58,7 +58,7 @@ impl SsoNonce {
         }}
     }
 
-    pub fn find_by_org_and_nonce(org_uuid: &str, nonce: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_org_and_nonce(org_uuid: &str, nonce: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             sso_nonce::table
                 .filter(sso_nonce::org_uuid.eq(org_uuid))
