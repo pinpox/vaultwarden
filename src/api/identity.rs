@@ -222,7 +222,7 @@ async fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> Json
 
     // Check if org policy prevents password login
     let user_orgs = UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::RequireSso, &conn).await;
-    if user_orgs.len() >= 1 && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
+    if !user_orgs.is_empty() && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
         // if requires SSO is active, user is in exactly one org by policy rules
         // policy only applies to "non-owner/non-admin" members
 
@@ -712,7 +712,7 @@ async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient
         .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
 
     // println!("TEST6");
-    return Ok(client);
+    Ok(client);
 }
 
 #[get("/connect/authorize?<domain_hint>&<state>")]
@@ -748,7 +748,7 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             authorize_url.set_query(Some(full_query.as_str()));
 
             println!("REDIRECTING {}", authorize_url.to_string());
-            return Ok(Redirect::to(authorize_url.to_string()));
+            Ok(Redirect::to(authorize_url.to_string()));
         }
         Err(_err) => err!("Unable to find client from identifier"),
     }

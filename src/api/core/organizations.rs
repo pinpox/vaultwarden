@@ -427,8 +427,7 @@ async fn put_organization_sso(
     let mut sso_config = match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => sso_config,
         None => {
-            let sso_config = SsoConfig::new(org_id);
-            sso_config
+            SsoConfig::new(org_id)
         }
     };
 
