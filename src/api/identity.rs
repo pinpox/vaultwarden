@@ -111,7 +111,7 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
     let organization = Organization::find_by_identifier(org_identifier, &conn).await.unwrap();
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
 
-    let (access_token, refresh_token) = match get_auth_code_access_token(&code, &sso_config).await {
+    let (access_token, refresh_token) = match get_auth_code_access_token(code, &sso_config).await {
         Ok((access_token, refresh_token)) => (access_token, refresh_token),
         Err(err) => err!(err),
     };
@@ -673,7 +673,7 @@ async fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
         }
     }
 
-    if domainHint == "" {
+    if domainHint.is_empty() {
         return err_code!("No Organization Identifier Provided", Status::BadRequest.code);
     }
 
@@ -698,7 +698,7 @@ async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient
 
     let test = CoreProviderMetadata::discover_async(issuer_url, async_http_client).await;
 
-    let provider_metadata = match test{
+    let provider_metadata = match test {
         Ok(metadata) => metadata,
         Err(_err) => {
             return Err("Failed to discover OpenID provider");
@@ -736,7 +736,7 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
 
             // it seems impossible to set the state going in dynamically (requires static lifetime string)
             // so I change it after the fact
-            let old_pairs = authorize_url.query_pairs().clone();
+            let old_pairs = authorize_url.query_pairs();
             let new_pairs = old_pairs.map(|pair| {
                 let (key, value) = pair;
                 if key == "state" {
@@ -747,7 +747,9 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             let full_query = Vec::from_iter(new_pairs).join("&");
             authorize_url.set_query(Some(full_query.as_str()));
 
-            println!("REDIRECTING {}", authorize_url.to_string());
+            // TODO remove after debugging
+            println!("REDIRECTING {}", authorize_url);
+
             Ok(Redirect::to(authorize_url.to_string()))
         }
         Err(_err) => err!("Unable to find client from identifier"),
