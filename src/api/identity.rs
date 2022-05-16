@@ -712,7 +712,7 @@ async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient
         .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
 
     // println!("TEST6");
-    Ok(client);
+    Ok(client)
 }
 
 #[get("/connect/authorize?<domain_hint>&<state>")]
@@ -748,7 +748,7 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             authorize_url.set_query(Some(full_query.as_str()));
 
             println!("REDIRECTING {}", authorize_url.to_string());
-            Ok(Redirect::to(authorize_url.to_string()));
+            Ok(Redirect::to(authorize_url.to_string()))
         }
         Err(_err) => err!("Unable to find client from identifier"),
     }
