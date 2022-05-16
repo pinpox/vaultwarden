@@ -761,7 +761,7 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
 async fn get_auth_code_access_token(code: &str, sso_config: &SsoConfig) -> Result<(String, String), &'static str> {
     let oidc_code = AuthorizationCode::new(String::from(code));
     match get_client_from_sso_config(sso_config).await {
-        Ok(client) => match client.exchange_code(oidc_code).request(async_http_client) {
+        Ok(client) => match client.exchange_code(oidc_code).request_async(async_http_client).await {
             Ok(token_response) => {
                 let access_token = token_response.access_token().secret().to_string();
                 let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
