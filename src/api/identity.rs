@@ -688,18 +688,13 @@ use openidconnect::{
 };
 
 async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
-    println!("TEST0");
     let redirect = sso_config.callback_path.to_string();
-    println!("TEST1");
     let client_id = ClientId::new(sso_config.client_id.as_ref().unwrap().to_string());
-    println!("TEST2");
     let client_secret = ClientSecret::new(sso_config.client_secret.as_ref().unwrap().to_string());
-    println!("TEST3");
     let issuer_url =
         IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
-    println!("TEST4");
 
-    println!("{:?}", issuer_url);
+    // println!("{:?}", issuer_url);
 
     let test = CoreProviderMetadata::discover_async(issuer_url, async_http_client).await;
 
@@ -710,13 +705,13 @@ async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient
         }
     };
 
-    println!("{:?}", provider_metadata);
+    // println!("{:?}", provider_metadata);
 
-    println!("TEST5");
+    // println!("TEST5");
     let client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret))
         .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
 
-    println!("TEST6");
+    // println!("TEST6");
     return Ok(client);
 }
 
@@ -752,6 +747,7 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             let full_query = Vec::from_iter(new_pairs).join("&");
             authorize_url.set_query(Some(full_query.as_str()));
 
+            println!("REDIRECTING {}", authorize_url.to_string());
             return Ok(Redirect::to(authorize_url.to_string()));
         }
         Err(_err) => err!("Unable to find client from identifier"),
