@@ -111,7 +111,7 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
     let organization = Organization::find_by_identifier(org_identifier, &conn).await.unwrap();
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
 
-    let (access_token, refresh_token) = match get_auth_code_access_token(&code, &sso_config) {
+    let (access_token, refresh_token) = match get_auth_code_access_token(&code, &sso_config).await {
         Ok((access_token, refresh_token)) => (access_token, refresh_token),
         Err(err) => err!(err),
     };
@@ -222,7 +222,7 @@ async fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> Json
 
     // Check if org policy prevents password login
     let user_orgs = UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::RequireSso, &conn).await;
-    if !user_orgs.len().is_empty() && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
+    if user_orgs.len() >= 1 && user_orgs[0].atype != UserOrgType::Owner && user_orgs[0].atype != UserOrgType::Admin {
         // if requires SSO is active, user is in exactly one org by policy rules
         // policy only applies to "non-owner/non-admin" members
 
@@ -605,9 +605,7 @@ struct ConnectData {
     org_identifier: Option<String>,
 }
 
-
 // TODO: https://github.com/SergioBenitez/Rocket/pull/1489#issuecomment-1114750006
-
 
 // impl<'f> FromForm<'f> for ConnectData {
 // type Error = String;
@@ -675,7 +673,7 @@ async fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
         }
     }
 
-    if domainHint.is_empty() {
+    if domainHint == "" {
         return err_code!("No Organization Identifier Provided", Status::BadRequest.code);
     }
 
@@ -683,34 +681,50 @@ async fn prevalidate(domainHint: String, conn: DbConn) -> JsonResult {
 }
 
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
-use openidconnect::reqwest::http_client;
+use openidconnect::reqwest::async_http_client;
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
     RedirectUrl, Scope,
 };
 
-fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
+async fn get_client_from_sso_config(sso_config: &SsoConfig) -> Result<CoreClient, &'static str> {
+    println!("TEST0");
     let redirect = sso_config.callback_path.to_string();
+    println!("TEST1");
     let client_id = ClientId::new(sso_config.client_id.as_ref().unwrap().to_string());
+    println!("TEST2");
     let client_secret = ClientSecret::new(sso_config.client_secret.as_ref().unwrap().to_string());
+    println!("TEST3");
     let issuer_url =
         IssuerUrl::new(sso_config.authority.as_ref().unwrap().to_string()).or(Err("invalid issuer URL"))?;
-    let provider_metadata = match CoreProviderMetadata::discover(&issuer_url, http_client) {
+    println!("TEST4");
+
+    println!("{:?}", issuer_url);
+
+    let test = CoreProviderMetadata::discover_async(issuer_url, async_http_client).await;
+
+    let provider_metadata = match test{
         Ok(metadata) => metadata,
         Err(_err) => {
             return Err("Failed to discover OpenID provider");
         }
     };
+
+    println!("{:?}", provider_metadata);
+
+    println!("TEST5");
     let client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret))
         .set_redirect_uri(RedirectUrl::new(redirect).or(Err("Invalid redirect URL"))?);
-    Ok(client);
+
+    println!("TEST6");
+    return Ok(client);
 }
 
 #[get("/connect/authorize?<domain_hint>&<state>")]
 async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResult<Redirect> {
     let organization = Organization::find_by_identifier(&domain_hint, &conn).await.unwrap();
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
-    match get_client_from_sso_config(&sso_config) {
+    match get_client_from_sso_config(&sso_config).await {
         Ok(client) => {
             let (mut authorize_url, _csrf_state, nonce) = client
                 .authorize_url(
@@ -738,16 +752,16 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             let full_query = Vec::from_iter(new_pairs).join("&");
             authorize_url.set_query(Some(full_query.as_str()));
 
-            Ok(Redirect::to(authorize_url.to_string()));
+            return Ok(Redirect::to(authorize_url.to_string()));
         }
         Err(_err) => err!("Unable to find client from identifier"),
     }
 }
 
-fn get_auth_code_access_token(code: &str, sso_config: &SsoConfig) -> Result<(String, String), &'static str> {
+async fn get_auth_code_access_token(code: &str, sso_config: &SsoConfig) -> Result<(String, String), &'static str> {
     let oidc_code = AuthorizationCode::new(String::from(code));
-    match get_client_from_sso_config(sso_config) {
-        Ok(client) => match client.exchange_code(oidc_code).request(http_client) {
+    match get_client_from_sso_config(sso_config).await {
+        Ok(client) => match client.exchange_code(oidc_code).request(async_http_client) {
             Ok(token_response) => {
                 let access_token = token_response.access_token().secret().to_string();
                 let refresh_token = token_response.refresh_token().unwrap().secret().to_string();
