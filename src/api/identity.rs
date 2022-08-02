@@ -29,14 +29,18 @@ pub fn routes() -> Vec<Route> {
 
 #[post("/connect/token", data = "<data>")]
 async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResult {
+    println!("connectdata {:?} ", data);
+
     let data: ConnectData = data.into_inner();
 
     match data.grant_type.as_ref() {
         "refresh_token" => {
+            info!("Login try via REFRESH_TOKEN");
             _check_is_some(&data.refresh_token, "refresh_token cannot be blank")?;
             _refresh_login(data, conn).await
         }
         "password" => {
+            info!("Login try via PASSWORD");
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
             _check_is_some(&data.password, "password cannot be blank")?;
             _check_is_some(&data.scope, "scope cannot be blank")?;
@@ -46,9 +50,13 @@ async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResul
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _password_login(data, conn, &ip).await
+            info!("Login try via PASSWORD complete");
+            let lresult = _password_login(data, conn, &ip).await;
+            info!("PASSWORD lresult {:?}", lresult);
+            lresult
         }
         "client_credentials" => {
+            info!("Login try via CLIENT_CREDENTIALS");
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
             _check_is_some(&data.client_secret, "client_secret cannot be blank")?;
             _check_is_some(&data.scope, "scope cannot be blank")?;
@@ -56,11 +64,15 @@ async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResul
             _api_key_login(data, conn, &ip).await
         }
         "authorization_code" => {
+            info!("Login try via AUTHORIZATION_CODE");
             _check_is_some(&data.code, "code cannot be blank")?;
             _check_is_some(&data.org_identifier, "org_identifier cannot be blank")?;
             _check_is_some(&data.device_identifier, "device identifier cannot be blank")?;
 
-            _authorization_login(data, conn, &ip).await
+            info!("Login try via AUTHORIZATION_CODE complete");
+            let lresult = _authorization_login(data, conn, &ip).await;
+            info!("AUTHORIXATION_CODE lresult {:?}", lresult);
+            lresult
         }
         t => err!("Invalid type", t),
     }
@@ -108,11 +120,31 @@ struct TokenPayload {
 async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
     let org_identifier = data.org_identifier.as_ref().unwrap();
     let code = data.code.as_ref().unwrap();
+
+    // println!("data {:?}", data);
+    // ConnectData {
+    // grant_type: "authorization_code",
+    // refresh_token: None,
+    // client_id: Some("web"),
+    // client_secret: None,
+    // password: None,
+    // scope: Some("api offline_access"),
+    // username: None,
+    // device_identifier: Some("41008f7b-6706-48a7-8c2e-482b45beec4f"),
+    // device_name: Some("chrome"),
+    // device_type: Some("9"),
+    // _device_push_token: None,
+    // two_factor_provider: None,
+    // two_factor_token: None,
+    // two_factor_remember: None,
+    // code: Some("t1Js1U15ogCgkepU5AZDhs9jAhPEMTTGZR8maiGr3ygM"),
+    // org_identifier: Some("inovex-test") }
+
     let organization = Organization::find_by_identifier(org_identifier, &conn).await.unwrap();
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
 
-    let (access_token, refresh_token, id_token) = match get_auth_code_access_token(code, &sso_config).await {
-        Ok((access_token, refresh_token, id_token)) => (access_token, refresh_token, id_token),
+    let (_access_token, refresh_token, id_token) = match get_auth_code_access_token(code, &sso_config).await {
+        Ok((_access_token, refresh_token, id_token)) => (_access_token, refresh_token, id_token),
         Err(err) => err!(err),
     };
 
@@ -120,6 +152,8 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
     // let token = jsonwebtoken::decode::<TokenPayload>(access_token.as_str()).unwrap().claims;
     let mut validation = jsonwebtoken::Validation::default();
     validation.insecure_disable_signature_validation();
+
+    println!("ID_TOKEN: {}", id_token.as_str());
 
     let token = jsonwebtoken::decode::<TokenPayload>(id_token.as_str(), &DecodingKey::from_secret(&[]), &validation)
         .unwrap()
@@ -134,7 +168,7 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
         Some(sso_nonce) => {
             match sso_nonce.delete(&conn).await {
                 Ok(_) => {
-                    let expiry = token.exp;
+                    // let expiry = token.exp;
                     let user_email = token.email;
                     let now = Utc::now().naive_utc();
 
@@ -161,9 +195,14 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
                     device.refresh_token = refresh_token.clone();
                     device.save(&conn).await?;
 
+                    let scope_vec = vec!["api".into(), "offline_access".into()];
+                    let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, &conn).await;
+                    let (access_token_new, expires_in) = device.refresh_tokens(&user, orgs, scope_vec);
+                    device.save(&conn).await?;
+
                     let mut result = json!({
-                        "access_token": access_token,
-                        "expires_in": expiry - now.timestamp(),
+                        "access_token": access_token_new,
+                        "expires_in": expires_in,
                         "token_type": "Bearer",
                         "refresh_token": refresh_token,
                         "Key": user.akey,
@@ -180,6 +219,8 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
                         result["TwoFactorToken"] = Value::String(token);
                     }
 
+                    println!("_authorization_login JSON result {}", result);
+                    info!("User {} logged in successfully. IP: {}", user.email, ip.ip);
                     Ok(Json(result))
                 }
                 Err(_) => err!("Failed to delete nonce"),
