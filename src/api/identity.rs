@@ -29,18 +29,14 @@ pub fn routes() -> Vec<Route> {
 
 #[post("/connect/token", data = "<data>")]
 async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResult {
-    println!("connectdata {:?} ", data);
-
     let data: ConnectData = data.into_inner();
 
     match data.grant_type.as_ref() {
         "refresh_token" => {
-            info!("Login try via REFRESH_TOKEN");
             _check_is_some(&data.refresh_token, "refresh_token cannot be blank")?;
             _refresh_login(data, conn).await
         }
         "password" => {
-            info!("Login try via PASSWORD");
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
             _check_is_some(&data.password, "password cannot be blank")?;
             _check_is_some(&data.scope, "scope cannot be blank")?;
@@ -50,13 +46,9 @@ async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResul
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            info!("Login try via PASSWORD complete");
-            let lresult = _password_login(data, conn, &ip).await;
-            info!("PASSWORD lresult {:?}", lresult);
-            lresult
+            _password_login(data, conn, &ip).await
         }
         "client_credentials" => {
-            info!("Login try via CLIENT_CREDENTIALS");
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
             _check_is_some(&data.client_secret, "client_secret cannot be blank")?;
             _check_is_some(&data.scope, "scope cannot be blank")?;
@@ -64,15 +56,11 @@ async fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResul
             _api_key_login(data, conn, &ip).await
         }
         "authorization_code" => {
-            info!("Login try via AUTHORIZATION_CODE");
             _check_is_some(&data.code, "code cannot be blank")?;
             _check_is_some(&data.org_identifier, "org_identifier cannot be blank")?;
             _check_is_some(&data.device_identifier, "device identifier cannot be blank")?;
 
-            info!("Login try via AUTHORIZATION_CODE complete");
-            let lresult = _authorization_login(data, conn, &ip).await;
-            info!("AUTHORIXATION_CODE lresult {:?}", lresult);
-            lresult
+            _authorization_login(data, conn, &ip).await
         }
         t => err!("Invalid type", t),
     }
@@ -121,25 +109,6 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
     let org_identifier = data.org_identifier.as_ref().unwrap();
     let code = data.code.as_ref().unwrap();
 
-    // println!("data {:?}", data);
-    // ConnectData {
-    // grant_type: "authorization_code",
-    // refresh_token: None,
-    // client_id: Some("web"),
-    // client_secret: None,
-    // password: None,
-    // scope: Some("api offline_access"),
-    // username: None,
-    // device_identifier: Some("41008f7b-6706-48a7-8c2e-482b45beec4f"),
-    // device_name: Some("chrome"),
-    // device_type: Some("9"),
-    // _device_push_token: None,
-    // two_factor_provider: None,
-    // two_factor_token: None,
-    // two_factor_remember: None,
-    // code: Some("t1Js1U15ogCgkepU5AZDhs9jAhPEMTTGZR8maiGr3ygM"),
-    // org_identifier: Some("inovex-test") }
-
     let organization = Organization::find_by_identifier(org_identifier, &conn).await.unwrap();
     let sso_config = SsoConfig::find_by_org(&organization.uuid, &conn).await.unwrap();
 
@@ -153,15 +122,11 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
     let mut validation = jsonwebtoken::Validation::default();
     validation.insecure_disable_signature_validation();
 
-    println!("ID_TOKEN: {}", id_token.as_str());
-
     let token = jsonwebtoken::decode::<TokenPayload>(id_token.as_str(), &DecodingKey::from_secret(&[]), &validation)
         .unwrap()
         .claims;
 
     // let expiry = token.exp;
-    // let user_email = token.email;
-    // let now = Utc::now().naive_utc();
     let nonce = token.nonce;
 
     match SsoNonce::find_by_org_and_nonce(&organization.uuid, &nonce, &conn).await {
@@ -219,7 +184,6 @@ async fn _authorization_login(data: ConnectData, conn: DbConn, ip: &ClientIp) ->
                         result["TwoFactorToken"] = Value::String(token);
                     }
 
-                    println!("_authorization_login JSON result {}", result);
                     info!("User {} logged in successfully. IP: {}", user.email, ip.ip);
                     Ok(Json(result))
                 }
@@ -782,9 +746,6 @@ async fn authorize(domain_hint: String, state: String, conn: DbConn) -> ApiResul
             });
             let full_query = Vec::from_iter(new_pairs).join("&");
             authorize_url.set_query(Some(full_query.as_str()));
-
-            // TODO remove after debugging
-            println!("REDIRECTING {}", authorize_url);
 
             Ok(Redirect::to(authorize_url.to_string()))
         }

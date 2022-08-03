@@ -324,12 +324,10 @@ async fn post_organization(
 
 #[get("/organizations/<org_id>/sso")]
 async fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) -> JsonResult {
-    let test = match SsoConfig::find_by_org(&org_id, &conn).await {
+    match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => Ok(Json(sso_config.to_json())),
         None => err!("Can't find organization sso config"),
-    };
-    // print!("{:?}", test);
-    test
+    }
 }
 
 #[post("/organizations/<org_id>/sso", data = "<data>")]
@@ -412,15 +410,6 @@ async fn put_organization_sso(
         d.SpWantAssertionsSigned
     );
 
-    // let data2: OrganizationSsoUpdateData = data.into_inner().data;
-
-    // print!("TEST1: {:?}", data2);
-    // print!("TEST2: {:?}", data2.Enabled);
-    // print!("TEST3: {:?}", data2.Data);
-    // print!("TEST3: {:?}", data2.Data.unwrap().
-    // print!("TEST3: {:?}", data2.Data.Authority);
-    // print!("TEST4: {:?}", data2.Data.SsoOrganizationData);
-
     let mut sso_config = match SsoConfig::find_by_org(&org_id, &conn).await {
         Some(sso_config) => sso_config,
         None => SsoConfig::new(org_id),
@@ -430,8 +419,10 @@ async fn put_organization_sso(
 
     // let sso_config_data = data.Data.unwrap();
 
-    sso_config.callback_path = "".to_string(); //data.CallbackPath;
-    sso_config.signed_out_callback_path = "".to_string(); //data2.Data.unwrap().call
+    // TODO use real values
+    sso_config.callback_path = "http://localhost:8000/#/sso".to_string(); //data.CallbackPath;
+    sso_config.signed_out_callback_path = "http://localhost:8000/#/sso".to_string(); //data2.Data.unwrap().call
+
     sso_config.authority = d.Authority;
     sso_config.client_id = d.ClientId;
     sso_config.client_secret = d.ClientSecret;
