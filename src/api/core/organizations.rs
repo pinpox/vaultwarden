@@ -226,7 +226,6 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, conn: 
 
     org.save(&conn).await?;
     user_org.save(&conn).await?;
-    // sso_config.save(&conn).await?;
     sso_config.save(&conn).await?;
     collection.save(&conn).await?;
 
@@ -324,8 +323,14 @@ async fn post_organization(
 
 #[get("/organizations/<org_id>/sso")]
 async fn get_organization_sso(org_id: String, _headers: OwnerHeaders, conn: DbConn) -> JsonResult {
+    println!("GETTING SSO CONFIG");
+
     match SsoConfig::find_by_org(&org_id, &conn).await {
-        Some(sso_config) => Ok(Json(sso_config.to_json())),
+        Some(sso_config) => {
+            let config_json = Json(sso_config.to_json());
+            println!("{:?}", config_json);
+            Ok(config_json)
+        }
         None => err!("Can't find organization sso config"),
     }
 }
