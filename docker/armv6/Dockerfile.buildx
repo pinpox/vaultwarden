@@ -16,18 +16,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.28.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.28.1
-#     [vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5]
+#     $ docker pull vaultwarden/web-vault:v2022.6.2
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2022.6.2
+#     [vaultwarden/web-vault@sha256:1dfda41cbddeac5bc59540261fff8defcac37170b5ba02d29c12fa1215498f70]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5
-#     [vaultwarden/web-vault:v2.28.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:1dfda41cbddeac5bc59540261fff8defcac37170b5ba02d29c12fa1215498f70
+#     [vaultwarden/web-vault:v2022.6.2]
 #
-FROM vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5 as vault
+FROM vaultwarden/web-vault@sha256:1dfda41cbddeac5bc59540261fff8defcac37170b5ba02d29c12fa1215498f70 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.60-bullseye as build
+FROM rust:1.61-bullseye as build
 
 
 
@@ -123,11 +123,15 @@ RUN mkdir /data \
     openssl \
     ca-certificates \
     curl \
-    dumb-init \
     libmariadb-dev-compat \
     libpq5 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# In the Balena Bullseye images for armv6/rpi-debian there is a missing symlink.
+# This symlink was there in the buster images, and for some reason this is needed.
+# hadolint ignore=DL3059
+RUN ln -v -s /lib/ld-linux-armhf.so.3 /lib/ld-linux.so.3
 
 # hadolint ignore=DL3059
 RUN [ "cross-build-end" ]
@@ -147,10 +151,4 @@ COPY docker/start.sh /start.sh
 
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
-# Configures the startup!
-# We should be able to remove the dumb-init now with Rocket 0.5
-# But the balenalib images have some issues with there entry.sh
-# See: https://github.com/balena-io-library/base-images/issues/735
-# Lets keep using dumb-init for now, since that is working fine.
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]

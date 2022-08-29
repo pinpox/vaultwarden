@@ -1,6 +1,30 @@
-#![forbid(unsafe_code)]
-#![warn(rust_2018_idioms)]
-#![warn(rust_2021_compatibility)]
+#![forbid(unsafe_code, non_ascii_idents)]
+#![deny(
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    noop_method_call,
+    pointer_structural_match,
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_import_braces,
+    clippy::cast_lossless,
+    clippy::clone_on_ref_ptr,
+    clippy::equatable_if_let,
+    clippy::float_cmp_const,
+    clippy::inefficient_to_string,
+    clippy::linkedlist,
+    clippy::macro_use_imports,
+    clippy::manual_assert,
+    clippy::match_wildcard_for_single_variants,
+    clippy::mem_forget,
+    clippy::string_add_assign,
+    clippy::string_to_string,
+    clippy::unnecessary_join,
+    clippy::unnecessary_self_imports,
+    clippy::unused_async,
+    clippy::verbose_file_reads,
+    clippy::zero_sized_map_values
+)]
 #![cfg_attr(feature = "unstable", feature(ip))]
 // The recursion_limit is mainly triggered by the json!() macro.
 // The more key/value pairs there are the more recursion occurs.
@@ -37,6 +61,11 @@ use std::{
     thread,
 };
 
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, BufReader},
+};
+
 #[macro_use]
 mod error;
 mod api;
@@ -65,7 +94,7 @@ async fn main() -> Result<(), Error> {
 
     let extra_debug = matches!(level, LF::Trace | LF::Debug);
 
-    check_data_folder();
+    check_data_folder().await;
     check_rsa_keys().unwrap_or_else(|_| {
         error!("Error creating keys, exiting...");
         exit(1);
@@ -145,15 +174,13 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         // Hide failed to close stream messages
         .level_for("hyper::server", log::LevelFilter::Warn)
         // Silence rocket logs
-        .level_for("_", log::LevelFilter::Off)
+        .level_for("_", log::LevelFilter::Warn)
         .level_for("rocket::launch", log::LevelFilter::Error)
         .level_for("rocket::launch_", log::LevelFilter::Error)
         .level_for("rocket::rocket", log::LevelFilter::Warn)
         .level_for("rocket::server", log::LevelFilter::Warn)
         .level_for("rocket::fairing::fairings", log::LevelFilter::Warn)
         .level_for("rocket::shield::shield", log::LevelFilter::Warn)
-        // Never show html5ever and hyper::proto logs, too noisy
-        .level_for("html5ever", log::LevelFilter::Off)
         .level_for("hyper::proto", log::LevelFilter::Off)
         .level_for("hyper::client", log::LevelFilter::Off)
         // Prevent cookie_store logs
@@ -264,7 +291,7 @@ fn create_dir(path: &str, description: &str) {
     create_dir_all(path).expect(&err_msg);
 }
 
-fn check_data_folder() {
+async fn check_data_folder() {
     let data_folder = &CONFIG.data_folder();
     let path = Path::new(data_folder);
     if !path.exists() {
@@ -276,6 +303,53 @@ fn check_data_folder() {
         }
         exit(1);
     }
+
+    if is_running_in_docker()
+        && std::env::var("I_REALLY_WANT_VOLATILE_STORAGE").is_err()
+        && !docker_data_folder_is_persistent(data_folder).await
+    {
+        error!(
+            "No persistent volume!\n\
+            ########################################################################################\n\
+            # It looks like you did not configure a persistent volume!                             #\n\
+            # This will result in permanent data loss when the container is removed or updated!    #\n\
+            # If you really want to use volatile storage set `I_REALLY_WANT_VOLATILE_STORAGE=true` #\n\
+            ########################################################################################\n"
+        );
+        exit(1);
+    }
+}
+
+/// Detect when using Docker or Podman the DATA_FOLDER is either a bind-mount or a volume created manually.
+/// If not created manually, then the data will not be persistent.
+/// A none persistent volume in either Docker or Podman is represented by a 64 alphanumerical string.
+/// If we detect this string, we will alert about not having a persistent self defined volume.
+/// This probably means that someone forgot to add `-v /path/to/vaultwarden_data/:/data`
+async fn docker_data_folder_is_persistent(data_folder: &str) -> bool {
+    if let Ok(mountinfo) = File::open("/proc/self/mountinfo").await {
+        // Since there can only be one mountpoint to the DATA_FOLDER
+        // We do a basic check for this mountpoint surrounded by a space.
+        let data_folder_match = if data_folder.starts_with('/') {
+            format!(" {data_folder} ")
+        } else {
+            format!(" /{data_folder} ")
+        };
+        let mut lines = BufReader::new(mountinfo).lines();
+        while let Some(line) = lines.next_line().await.unwrap_or_default() {
+            // Only execute a regex check if we find the base match
+            if line.contains(&data_folder_match) {
+                let re = regex::Regex::new(r"/volumes/[a-z0-9]{64}/_data /").unwrap();
+                if re.is_match(&line) {
+                    return false;
+                }
+                // If we did found a match for the mountpoint, but not the regex, then still stop searching.
+                break;
+            }
+        }
+    }
+    // In all other cases, just assume a true.
+    // This is just an informative check to try and prevent data loss.
+    true
 }
 
 fn check_rsa_keys() -> Result<(), crate::error::Error> {
@@ -292,7 +366,7 @@ fn check_rsa_keys() -> Result<(), crate::error::Error> {
     }
 
     if !util::file_exists(&pub_path) {
-        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&util::read_file(&priv_path)?)?;
+        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&std::fs::read(&priv_path)?)?;
 
         let pub_key = rsa_key.public_key_to_pem()?;
         crate::util::write_file(&pub_path, &pub_key)?;
@@ -336,10 +410,11 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     let mut config = rocket::Config::from(rocket::Config::figment());
     config.temp_dir = canonicalize(CONFIG.tmp_folder()).unwrap().into();
-    config.limits = Limits::new() //
-        .limit("json", 10.megabytes())
-        .limit("data-form", 150.megabytes())
-        .limit("file", 150.megabytes());
+    config.cli_colors = false; // Make sure Rocket does not color any values for logging.
+    config.limits = Limits::new()
+        .limit("json", 20.megabytes()) // 20MB should be enough for very large imports, something like 5000+ vault entries
+        .limit("data-form", 525.megabytes()) // This needs to match the maximum allowed file size for Send
+        .limit("file", 525.megabytes()); // This needs to match the maximum allowed file size for attachments
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
@@ -382,7 +457,7 @@ async fn schedule_jobs(pool: db::DbPool) {
     thread::Builder::new()
         .name("job-scheduler".to_string())
         .spawn(move || {
-            use job_scheduler::{Job, JobScheduler};
+            use job_scheduler_ng::{Job, JobScheduler};
             let _runtime_guard = runtime.enter();
 
             let mut sched = JobScheduler::new();
