@@ -79,7 +79,6 @@ fn admin_disabled() -> &'static str {
 
 const COOKIE_NAME: &str = "VW_ADMIN";
 const ADMIN_PATH: &str = "/admin";
-const DT_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
 
 const BASE_TEMPLATE: &str = "admin/base";
 
@@ -276,7 +275,7 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
 
     async fn _generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
-            mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None).await
+            mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None)
         } else {
             let invitation = Invitation::new(user.email.clone());
             invitation.save(conn).await
@@ -290,11 +289,11 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
 }
 
 #[post("/test/smtp", data = "<data>")]
-async fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
+fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
     let data: InviteData = data.into_inner();
 
     if CONFIG.mail_enabled() {
-        mail::send_test(&data.email).await
+        mail::send_test(&data.email)
     } else {
         err!("Mail is not enabled")
     }
@@ -311,10 +310,7 @@ async fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
     let users_json = stream::iter(User::get_all(&conn).await)
         .then(|u| async {
             let u = u; // Move out this single variable
-            let mut usr = u.to_json(&conn).await;
-            usr["UserEnabled"] = json!(u.enabled);
-            usr["CreatedAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
-            usr
+            u.to_json(&conn).await
         })
         .collect::<Vec<Value>>()
         .await;
@@ -324,6 +320,8 @@ async fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
 
 #[get("/users/overview")]
 async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
+    const DT_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
+
     let users_json = stream::iter(User::get_all(&conn).await)
         .then(|u| async {
             let u = u; // Move out this single variable
@@ -348,11 +346,9 @@ async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<Stri
 
 #[get("/users/<uuid>")]
 async fn get_user_json(uuid: String, _token: AdminToken, conn: DbConn) -> JsonResult {
-    let u = get_user_or_404(&uuid, &conn).await?;
-    let mut usr = u.to_json(&conn).await;
-    usr["UserEnabled"] = json!(u.enabled);
-    usr["CreatedAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
-    Ok(Json(usr))
+    let user = get_user_or_404(&uuid, &conn).await?;
+
+    Ok(Json(user.to_json(&conn).await))
 }
 
 #[post("/users/<uuid>/delete")]
@@ -427,7 +423,7 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, c
         }
     }
 
-    user_to_edit.atype = new_type;
+    user_to_edit.atype = new_type as i32;
     user_to_edit.save(&conn).await
 }
 
@@ -491,14 +487,41 @@ async fn has_http_access() -> bool {
     }
 }
 
-use cached::proc_macro::cached;
-/// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already.
-/// It will cache this function for 300 seconds (5 minutes) which should prevent the exhaustion of the rate limit.
-#[cached(time = 300, sync_writes = true)]
-async fn get_release_info(has_http_access: bool, running_within_docker: bool) -> (String, String, String) {
+#[get("/diagnostics")]
+async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
+    use crate::util::read_file_string;
+    use chrono::prelude::*;
+    use std::net::ToSocketAddrs;
+
+    // Get current running versions
+    let web_vault_version: WebVaultVersion =
+        match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "vw-version.json")) {
+            Ok(s) => serde_json::from_str(&s)?,
+            _ => match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "version.json")) {
+                Ok(s) => serde_json::from_str(&s)?,
+                _ => WebVaultVersion {
+                    version: String::from("Version file missing"),
+                },
+            },
+        };
+
+    // Execute some environment checks
+    let running_within_docker = is_running_in_docker();
+    let has_http_access = has_http_access().await;
+    let uses_proxy = env::var_os("HTTP_PROXY").is_some()
+        || env::var_os("http_proxy").is_some()
+        || env::var_os("HTTPS_PROXY").is_some()
+        || env::var_os("https_proxy").is_some();
+
+    // Check if we are able to resolve DNS entries
+    let dns_resolved = match ("github.com", 0).to_socket_addrs().map(|mut i| i.next()) {
+        Ok(Some(a)) => a.ip().to_string(),
+        _ => "Could not resolve domain name.".to_string(),
+    };
+
     // If the HTTP Check failed, do not even attempt to check for new versions since we were not able to connect with github.com anyway.
-    if has_http_access {
-        info!("Running get_release_info!!");
+    // TODO: Maybe we need to cache this using a LazyStatic or something. Github only allows 60 requests per hour, and we use 3 here already.
+    let (latest_release, latest_commit, latest_web_build) = if has_http_access {
         (
             match get_github_api::<GitRelease>("https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest")
                 .await
@@ -531,42 +554,7 @@ async fn get_release_info(has_http_access: bool, running_within_docker: bool) ->
         )
     } else {
         ("-".to_string(), "-".to_string(), "-".to_string())
-    }
-}
-
-#[get("/diagnostics")]
-async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
-    use chrono::prelude::*;
-    use std::net::ToSocketAddrs;
-
-    // Get current running versions
-    let web_vault_version: WebVaultVersion =
-        match std::fs::read_to_string(&format!("{}/{}", CONFIG.web_vault_folder(), "vw-version.json")) {
-            Ok(s) => serde_json::from_str(&s)?,
-            _ => match std::fs::read_to_string(&format!("{}/{}", CONFIG.web_vault_folder(), "version.json")) {
-                Ok(s) => serde_json::from_str(&s)?,
-                _ => WebVaultVersion {
-                    version: String::from("Version file missing"),
-                },
-            },
-        };
-
-    // Execute some environment checks
-    let running_within_docker = is_running_in_docker();
-    let has_http_access = has_http_access().await;
-    let uses_proxy = env::var_os("HTTP_PROXY").is_some()
-        || env::var_os("http_proxy").is_some()
-        || env::var_os("HTTPS_PROXY").is_some()
-        || env::var_os("https_proxy").is_some();
-
-    // Check if we are able to resolve DNS entries
-    let dns_resolved = match ("github.com", 0).to_socket_addrs().map(|mut i| i.next()) {
-        Ok(Some(a)) => a.ip().to_string(),
-        _ => "Could not resolve domain name.".to_string(),
     };
-
-    let (latest_release, latest_commit, latest_web_build) =
-        get_release_info(has_http_access, running_within_docker).await;
 
     let ip_header_name = match &ip_header.0 {
         Some(h) => h,

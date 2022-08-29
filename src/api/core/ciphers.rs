@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{NaiveDateTime, Utc};
-use futures::{stream, stream::StreamExt};
 use rocket::fs::TempFile;
 use rocket::serde::json::Json;
 use rocket::{
@@ -18,7 +17,7 @@ use crate::{
     CONFIG,
 };
 
-use super::folders::FolderData;
+use futures::{stream, stream::StreamExt};
 
 pub fn routes() -> Vec<Route> {
     // Note that many routes have an `admin` variant; this seems to be
@@ -105,7 +104,7 @@ async fn sync(data: SyncData, headers: Headers, conn: DbConn) -> Json<Value> {
     // Get all ciphers which are visible by the user
     let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
 
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, CipherSyncType::User, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, &conn).await;
 
     // Lets generate the ciphers_json using all the gathered info
     let ciphers_json: Vec<Value> = stream::iter(ciphers)
@@ -155,7 +154,7 @@ async fn sync(data: SyncData, headers: Headers, conn: DbConn) -> Json<Value> {
 #[get("/ciphers")]
 async fn get_ciphers(headers: Headers, conn: DbConn) -> Json<Value> {
     let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, CipherSyncType::User, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, &conn).await;
 
     let ciphers_json = stream::iter(ciphers)
         .then(|c| async {
@@ -213,7 +212,7 @@ pub struct CipherData {
     Card = 3,
     Identity = 4
     */
-    pub Type: i32,
+    pub Type: i32, // TODO: Change this to NumberOrString
     pub Name: String,
     Notes: Option<String>,
     Fields: Option<Value>,
@@ -230,9 +229,8 @@ pub struct CipherData {
     PasswordHistory: Option<Value>,
 
     // These are used during key rotation
-    // 'Attachments' is unused, contains map of {id: filename}
     #[serde(rename = "Attachments")]
-    _Attachments: Option<Value>,
+    _Attachments: Option<Value>, // Unused, contains map of {id: filename}
     Attachments2: Option<HashMap<String, Attachments2Data>>,
 
     // The revision datetime (in ISO 8601 format) of the client's local copy
@@ -466,11 +464,13 @@ pub async fn update_cipher_from_data(
     cipher.set_favorite(data.Favorite, &headers.user.uuid, conn).await?;
 
     if ut != UpdateType::None {
-        nt.send_cipher_update(ut, cipher, &cipher.update_users_revision(conn).await).await;
+        nt.send_cipher_update(ut, cipher, &cipher.update_users_revision(conn).await);
     }
 
     Ok(())
 }
+
+use super::folders::FolderData;
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -527,7 +527,7 @@ async fn post_ciphers_import(
 
     let mut user = headers.user;
     user.update_revision(&conn).await?;
-    nt.send_user_update(UpdateType::Vault, &user).await;
+    nt.send_user_update(UpdateType::Vault, &user);
     Ok(())
 }
 
@@ -913,8 +913,8 @@ async fn save_attachment(
     // In the v2 API, the attachment record has already been created,
     // so the size limit needs to be adjusted to account for that.
     let size_adjust = match &attachment {
-        None => 0,                         // Legacy API
-        Some(a) => i64::from(a.file_size), // v2 API
+        None => 0,                     // Legacy API
+        Some(a) => a.file_size as i64, // v2 API
     };
 
     let size_limit = if let Some(ref user_uuid) = cipher.user_uuid {
@@ -946,17 +946,6 @@ async fn save_attachment(
     };
 
     let mut data = data.into_inner();
-
-    // There seems to be a bug somewhere regarding uploading attachments using the Android Client (Maybe iOS too?)
-    // See: https://github.com/dani-garcia/vaultwarden/issues/2644
-    // Since all other clients seem to match TempFile::File and not TempFile::Buffered lets catch this and return an error for now.
-    // We need to figure out how to solve this, but for now it's better to not accept these attachments since they will be broken.
-    if let TempFile::Buffered {
-        content: _,
-    } = &data.data
-    {
-        err!("Error reading attachment data. Please try an other client.");
-    }
 
     if let Some(size_limit) = size_limit {
         if data.data.len() > size_limit {
@@ -1009,11 +998,9 @@ async fn save_attachment(
         attachment.save(&conn).await.expect("Error saving attachment");
     }
 
-    if let Err(_err) = data.data.persist_to(&file_path).await {
-        data.data.move_copy_to(file_path).await?
-    }
+    data.data.persist_to(file_path).await?;
 
-    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn).await).await;
+    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn).await);
 
     Ok((cipher, conn))
 }
@@ -1279,7 +1266,7 @@ async fn move_cipher_selected(
         // Move cipher
         cipher.move_to_folder(data.FolderId.clone(), &user_uuid, &conn).await?;
 
-        nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &[user_uuid.clone()]).await;
+        nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &[user_uuid.clone()]);
     }
 
     Ok(())
@@ -1326,7 +1313,7 @@ async fn delete_all(
                 Some(user_org) => {
                     if user_org.atype == UserOrgType::Owner {
                         Cipher::delete_all_by_organization(&org_data.org_id, &conn).await?;
-                        nt.send_user_update(UpdateType::Vault, &user).await;
+                        nt.send_user_update(UpdateType::Vault, &user);
                         Ok(())
                     } else {
                         err!("You don't have permission to purge the organization vault");
@@ -1347,7 +1334,7 @@ async fn delete_all(
             }
 
             user.update_revision(&conn).await?;
-            nt.send_user_update(UpdateType::Vault, &user).await;
+            nt.send_user_update(UpdateType::Vault, &user);
             Ok(())
         }
     }
@@ -1372,10 +1359,10 @@ async fn _delete_cipher_by_uuid(
     if soft_delete {
         cipher.deleted_at = Some(Utc::now().naive_utc());
         cipher.save(conn).await?;
-        nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await).await;
+        nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await);
     } else {
         cipher.delete(conn).await?;
-        nt.send_cipher_update(UpdateType::CipherDelete, &cipher, &cipher.update_users_revision(conn).await).await;
+        nt.send_cipher_update(UpdateType::CipherDelete, &cipher, &cipher.update_users_revision(conn).await);
     }
 
     Ok(())
@@ -1420,7 +1407,7 @@ async fn _restore_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, n
     cipher.deleted_at = None;
     cipher.save(conn).await?;
 
-    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await).await;
+    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await);
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, conn).await))
 }
 
@@ -1482,7 +1469,7 @@ async fn _delete_cipher_attachment_by_id(
 
     // Delete attachment
     attachment.delete(conn).await?;
-    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await).await;
+    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(conn).await);
     Ok(())
 }
 
@@ -1499,38 +1486,24 @@ pub struct CipherSyncData {
     pub user_collections: HashMap<String, CollectionUser>,
 }
 
-pub enum CipherSyncType {
-    User,
-    Organization,
-}
-
 impl CipherSyncData {
-    pub async fn new(user_uuid: &str, ciphers: &Vec<Cipher>, sync_type: CipherSyncType, conn: &DbConn) -> Self {
+    pub async fn new(user_uuid: &str, ciphers: &Vec<Cipher>, conn: &DbConn) -> Self {
         // Generate a list of Cipher UUID's to be used during a query filter with an eq_any.
-        let cipher_uuids = stream::iter(ciphers).map(|c| c.uuid.clone()).collect::<Vec<String>>().await;
-
-        let mut cipher_folders: HashMap<String, String> = HashMap::new();
-        let mut cipher_favorites: HashSet<String> = HashSet::new();
-        match sync_type {
-            // User Sync supports Folders and Favorits
-            CipherSyncType::User => {
-                // Generate a HashMap with the Cipher UUID as key and the Folder UUID as value
-                cipher_folders = stream::iter(FolderCipher::find_by_user(user_uuid, conn).await).collect().await;
-
-                // Generate a HashSet of all the Cipher UUID's which are marked as favorite
-                cipher_favorites =
-                    stream::iter(Favorite::get_all_cipher_uuid_by_user(user_uuid, conn).await).collect().await;
-            }
-            // Organization Sync does not support Folders and Favorits.
-            // If these are set, it will cause issues in the web-vault.
-            CipherSyncType::Organization => {}
-        }
+        let cipher_uuids = stream::iter(ciphers).map(|c| c.uuid.to_string()).collect::<Vec<String>>().await;
 
         // Generate a list of Cipher UUID's containing a Vec with one or more Attachment records
         let mut cipher_attachments: HashMap<String, Vec<Attachment>> = HashMap::new();
         for attachment in Attachment::find_all_by_ciphers(&cipher_uuids, conn).await {
-            cipher_attachments.entry(attachment.cipher_uuid.clone()).or_default().push(attachment);
+            cipher_attachments.entry(attachment.cipher_uuid.to_string()).or_default().push(attachment);
         }
+
+        // Generate a HashMap with the Cipher UUID as key and the Folder UUID as value
+        let cipher_folders: HashMap<String, String> =
+            stream::iter(FolderCipher::find_by_user(user_uuid, conn).await).collect().await;
+
+        // Generate a HashSet of all the Cipher UUID's which are marked as favorite
+        let cipher_favorites: HashSet<String> =
+            stream::iter(Favorite::get_all_cipher_uuid_by_user(user_uuid, conn).await).collect().await;
 
         // Generate a HashMap with the Cipher UUID as key and one or more Collection UUID's
         let mut cipher_collections: HashMap<String, Vec<String>> = HashMap::new();
@@ -1541,14 +1514,14 @@ impl CipherSyncData {
         // Generate a HashMap with the Organization UUID as key and the UserOrganization record
         let user_organizations: HashMap<String, UserOrganization> =
             stream::iter(UserOrganization::find_by_user(user_uuid, conn).await)
-                .map(|uo| (uo.org_uuid.clone(), uo))
+                .map(|uo| (uo.org_uuid.to_string(), uo))
                 .collect()
                 .await;
 
         // Generate a HashMap with the User_Collections UUID as key and the CollectionUser record
         let user_collections: HashMap<String, CollectionUser> =
             stream::iter(CollectionUser::find_by_user(user_uuid, conn).await)
-                .map(|uc| (uc.collection_uuid.clone(), uc))
+                .map(|uc| (uc.collection_uuid.to_string(), uc))
                 .collect()
                 .await;
 

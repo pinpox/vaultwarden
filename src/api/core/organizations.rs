@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::{CipherSyncData, CipherSyncType},
-        EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType,
+        core::CipherSyncData, EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData,
+        UpdateType,
     },
     auth::{decode_invite, AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OwnerHeaders},
     db::{models::*, DbConn},
@@ -694,7 +694,7 @@ struct OrgIdData {
 #[get("/ciphers/organization-details?<data..>")]
 async fn get_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> Json<Value> {
     let ciphers = Cipher::find_by_org(&data.organization_id, &conn).await;
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, CipherSyncType::Organization, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, &conn).await;
 
     let ciphers_json = stream::iter(ciphers)
         .then(|c| async {
@@ -859,8 +859,7 @@ async fn send_invite(org_id: String, data: JsonUpcase<InviteData>, headers: Admi
                 Some(new_user.uuid),
                 &org_name,
                 Some(headers.user.email.clone()),
-            )
-            .await?;
+            )?;
         }
     }
 
@@ -940,8 +939,7 @@ async fn _reinvite_user(org_id: &str, user_org: &str, invited_by_email: &str, co
             Some(user_org.uuid),
             &org_name,
             Some(invited_by_email.to_string()),
-        )
-        .await?;
+        )?;
     } else {
         let invitation = Invitation::new(user.email);
         invitation.save(conn).await?;
@@ -1039,10 +1037,10 @@ async fn accept_invite(
         };
         if let Some(invited_by_email) = &claims.invited_by_email {
             // User was invited to an organization, so they must be confirmed manually after acceptance
-            mail::send_invite_accepted(&claims.email, invited_by_email, &org_name).await?;
+            mail::send_invite_accepted(&claims.email, invited_by_email, &org_name)?;
         } else {
             // User was invited from /admin, so they are automatically confirmed
-            mail::send_invite_confirmed(&claims.email, &org_name).await?;
+            mail::send_invite_confirmed(&claims.email, &org_name)?;
         }
     }
 
@@ -1137,7 +1135,7 @@ async fn _confirm_invite(
             Some(user) => user.email,
             None => err!("Error looking up user."),
         };
-        mail::send_invite_confirmed(&address, &org_name).await?;
+        mail::send_invite_confirmed(&address, &org_name)?;
     }
 
     user_to_confirm.save(conn).await
@@ -1507,7 +1505,7 @@ async fn put_policy(
                     let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
                     let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
 
-                    mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
+                    mail::send_2fa_removed_from_org(&user.email, &org.name)?;
                 }
                 member.delete(&conn).await?;
             }
@@ -1532,7 +1530,7 @@ async fn put_policy(
                         let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
                         let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
 
-                        mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
+                        mail::send_single_org_removed_from_org(&user.email, &org.name)?;
                     }
                     member.delete(&conn).await?;
                 }
@@ -1671,8 +1669,7 @@ async fn import(org_id: String, data: JsonUpcase<OrgImportData>, headers: Header
                         Some(new_org_user.uuid),
                         &org_name,
                         Some(headers.user.email.clone()),
-                    )
-                    .await?;
+                    )?;
                 }
             }
         }

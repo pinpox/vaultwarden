@@ -95,7 +95,7 @@ async fn enforce_disable_hide_email_policy(data: &SendData, headers: &Headers, c
     Ok(())
 }
 
-fn create_send(data: SendData, user_uuid: String) -> ApiResult<Send> {
+async fn create_send(data: SendData, user_uuid: String) -> ApiResult<Send> {
     let data_val = if data.Type == SendType::Text as i32 {
         data.Text
     } else if data.Type == SendType::File as i32 {
@@ -117,7 +117,7 @@ fn create_send(data: SendData, user_uuid: String) -> ApiResult<Send> {
         );
     }
 
-    let mut send = Send::new(data.Type, data.Name, data_str, data.Key, data.DeletionDate.naive_utc());
+    let mut send = Send::new(data.Type, data.Name, data_str, data.Key, data.DeletionDate.naive_utc()).await;
     send.user_uuid = Some(user_uuid);
     send.notes = data.Notes;
     send.max_access_count = match data.MaxAccessCount {
@@ -171,9 +171,9 @@ async fn post_send(data: JsonUpcase<SendData>, headers: Headers, conn: DbConn, n
         err!("File sends should use /api/sends/file")
     }
 
-    let mut send = create_send(data, headers.user.uuid)?;
+    let mut send = create_send(data, headers.user.uuid).await?;
     send.save(&conn).await?;
-    nt.send_send_update(UpdateType::SyncSendCreate, &send, &send.update_users_revision(&conn).await).await;
+    nt.send_send_update(UpdateType::SyncSendCreate, &send, &send.update_users_revision(&conn).await);
 
     Ok(Json(send.to_json()))
 }
@@ -211,20 +211,9 @@ async fn post_send_file(data: Form<UploadData<'_>>, headers: Headers, conn: DbCo
         None => SIZE_525_MB,
     };
 
-    let mut send = create_send(model, headers.user.uuid)?;
+    let mut send = create_send(model, headers.user.uuid).await?;
     if send.atype != SendType::File as i32 {
         err!("Send content is not a file");
-    }
-
-    // There seems to be a bug somewhere regarding uploading attachments using the Android Client (Maybe iOS too?)
-    // See: https://github.com/dani-garcia/vaultwarden/issues/2644
-    // Since all other clients seem to match TempFile::File and not TempFile::Buffered lets catch this and return an error for now.
-    // We need to figure out how to solve this, but for now it's better to not accept these attachments since they will be broken.
-    if let TempFile::Buffered {
-        content: _,
-    } = &data
-    {
-        err!("Error reading send file data. Please try an other client.");
     }
 
     let size = data.len();
@@ -236,10 +225,7 @@ async fn post_send_file(data: Form<UploadData<'_>>, headers: Headers, conn: DbCo
     let folder_path = tokio::fs::canonicalize(&CONFIG.sends_folder()).await?.join(&send.uuid);
     let file_path = folder_path.join(&file_id);
     tokio::fs::create_dir_all(&folder_path).await?;
-
-    if let Err(_err) = data.persist_to(&file_path).await {
-        data.move_copy_to(file_path).await?
-    }
+    data.persist_to(&file_path).await?;
 
     let mut data_value: Value = serde_json::from_str(&send.data)?;
     if let Some(o) = data_value.as_object_mut() {
@@ -251,7 +237,7 @@ async fn post_send_file(data: Form<UploadData<'_>>, headers: Headers, conn: DbCo
 
     // Save the changes in the database
     send.save(&conn).await?;
-    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await).await;
+    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await);
 
     Ok(Json(send.to_json()))
 }
@@ -432,7 +418,7 @@ async fn put_send(
     }
 
     send.save(&conn).await?;
-    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await).await;
+    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await);
 
     Ok(Json(send.to_json()))
 }
@@ -449,7 +435,7 @@ async fn delete_send(id: String, headers: Headers, conn: DbConn, nt: Notify<'_>)
     }
 
     send.delete(&conn).await?;
-    nt.send_send_update(UpdateType::SyncSendDelete, &send, &send.update_users_revision(&conn).await).await;
+    nt.send_send_update(UpdateType::SyncSendDelete, &send, &send.update_users_revision(&conn).await);
 
     Ok(())
 }
@@ -469,7 +455,7 @@ async fn put_remove_password(id: String, headers: Headers, conn: DbConn, nt: Not
 
     send.set_password(None);
     send.save(&conn).await?;
-    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await).await;
+    nt.send_send_update(UpdateType::SyncSendUpdate, &send, &send.update_users_revision(&conn).await);
 
     Ok(Json(send.to_json()))
 }

@@ -87,11 +87,11 @@ impl Device {
             nbf: time_now.timestamp(),
             exp: (time_now + *DEFAULT_VALIDITY).timestamp(),
             iss: JWT_LOGIN_ISSUER.to_string(),
-            sub: user.uuid.clone(),
+            sub: user.uuid.to_string(),
 
             premium: true,
-            name: user.name.clone(),
-            email: user.email.clone(),
+            name: user.name.to_string(),
+            email: user.email.to_string(),
             email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
 
             orgowner,
@@ -99,8 +99,8 @@ impl Device {
             orguser,
             orgmanager,
 
-            sstamp: user.security_stamp.clone(),
-            device: self.uuid.clone(),
+            sstamp: user.security_stamp.to_string(),
+            device: self.uuid.to_string(),
             scope,
             amr: vec!["Application".into()],
         };

@@ -5,10 +5,7 @@ use serde_json::Value;
 use std::borrow::Borrow;
 
 use crate::{
-    api::{
-        core::{CipherSyncData, CipherSyncType},
-        EmptyResult, JsonResult, JsonUpcase, NumberOrString,
-    },
+    api::{core::CipherSyncData, EmptyResult, JsonResult, JsonUpcase, NumberOrString},
     auth::{decode_emergency_access_invite, Headers},
     db::{models::*, DbConn, DbPool},
     mail, CONFIG,
@@ -251,8 +248,7 @@ async fn send_invite(data: JsonUpcase<EmergencyAccessInviteData>, headers: Heade
             Some(new_emergency_access.uuid),
             Some(grantor_user.name.clone()),
             Some(grantor_user.email),
-        )
-        .await?;
+        )?;
     } else {
         // Automatically mark user as accepted if no email invites
         match User::find_by_mail(&email, &conn).await {
@@ -305,8 +301,7 @@ async fn resend_invite(emer_id: String, headers: Headers, conn: DbConn) -> Empty
             Some(emergency_access.uuid),
             Some(grantor_user.name.clone()),
             Some(grantor_user.email),
-        )
-        .await?;
+        )?;
     } else {
         if Invitation::find_by_mail(&email, &conn).await.is_none() {
             let invitation = Invitation::new(email);
@@ -368,7 +363,7 @@ async fn accept_invite(emer_id: String, data: JsonUpcase<AcceptData>, conn: DbCo
         }
 
         if CONFIG.mail_enabled() {
-            mail::send_emergency_access_invite_accepted(&grantor_user.email, &grantee_user.email).await?;
+            mail::send_emergency_access_invite_accepted(&grantor_user.email, &grantee_user.email)?;
         }
 
         Ok(())
@@ -451,7 +446,7 @@ async fn confirm_emergency_access(
         emergency_access.save(&conn).await?;
 
         if CONFIG.mail_enabled() {
-            mail::send_emergency_access_invite_confirmed(&grantee_user.email, &grantor_user.name).await?;
+            mail::send_emergency_access_invite_confirmed(&grantee_user.email, &grantor_user.name)?;
         }
         Ok(Json(emergency_access.to_json()))
     } else {
@@ -497,8 +492,7 @@ async fn initiate_emergency_access(emer_id: String, headers: Headers, conn: DbCo
             &initiating_user.name,
             emergency_access.get_type_as_str(),
             &emergency_access.wait_time_days.clone().to_string(),
-        )
-        .await?;
+        )?;
     }
     Ok(Json(emergency_access.to_json()))
 }
@@ -534,7 +528,7 @@ async fn approve_emergency_access(emer_id: String, headers: Headers, conn: DbCon
         emergency_access.save(&conn).await?;
 
         if CONFIG.mail_enabled() {
-            mail::send_emergency_access_recovery_approved(&grantee_user.email, &grantor_user.name).await?;
+            mail::send_emergency_access_recovery_approved(&grantee_user.email, &grantor_user.name)?;
         }
         Ok(Json(emergency_access.to_json()))
     } else {
@@ -574,7 +568,7 @@ async fn reject_emergency_access(emer_id: String, headers: Headers, conn: DbConn
         emergency_access.save(&conn).await?;
 
         if CONFIG.mail_enabled() {
-            mail::send_emergency_access_recovery_rejected(&grantee_user.email, &grantor_user.name).await?;
+            mail::send_emergency_access_recovery_rejected(&grantee_user.email, &grantor_user.name)?;
         }
         Ok(Json(emergency_access.to_json()))
     } else {
@@ -602,8 +596,7 @@ async fn view_emergency_access(emer_id: String, headers: Headers, conn: DbConn) 
     }
 
     let ciphers = Cipher::find_owned_by_user(&emergency_access.grantor_uuid, &conn).await;
-    let cipher_sync_data =
-        CipherSyncData::new(&emergency_access.grantor_uuid, &ciphers, CipherSyncType::User, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&emergency_access.grantor_uuid, &ciphers, &conn).await;
 
     let ciphers_json = stream::iter(ciphers)
         .then(|c| async {
@@ -761,7 +754,7 @@ pub async fn emergency_request_timeout_job(pool: DbPool) {
         for mut emer in emergency_access_list {
             if emer.recovery_initiated_at.is_some()
                 && Utc::now().naive_utc()
-                    >= emer.recovery_initiated_at.unwrap() + Duration::days(i64::from(emer.wait_time_days))
+                    >= emer.recovery_initiated_at.unwrap() + Duration::days(emer.wait_time_days as i64)
             {
                 emer.status = EmergencyAccessStatus::RecoveryApproved as i32;
                 emer.save(&conn).await.expect("Cannot save emergency access on job");
@@ -782,11 +775,9 @@ pub async fn emergency_request_timeout_job(pool: DbPool) {
                         &grantee_user.name.clone(),
                         emer.get_type_as_str(),
                     )
-                    .await
                     .expect("Error on sending email");
 
                     mail::send_emergency_access_recovery_approved(&grantee_user.email, &grantor_user.name.clone())
-                        .await
                         .expect("Error on sending email");
                 }
             }
@@ -812,7 +803,7 @@ pub async fn emergency_notification_reminder_job(pool: DbPool) {
         for mut emer in emergency_access_list {
             if (emer.recovery_initiated_at.is_some()
                 && Utc::now().naive_utc()
-                    >= emer.recovery_initiated_at.unwrap() + Duration::days((i64::from(emer.wait_time_days)) - 1))
+                    >= emer.recovery_initiated_at.unwrap() + Duration::days((emer.wait_time_days as i64) - 1))
                 && (emer.last_notification_at.is_none()
                     || (emer.last_notification_at.is_some()
                         && Utc::now().naive_utc() >= emer.last_notification_at.unwrap() + Duration::days(1)))
@@ -836,7 +827,6 @@ pub async fn emergency_notification_reminder_job(pool: DbPool) {
                         emer.get_type_as_str(),
                         &emer.wait_time_days.to_string(), // TODO(jjlin): This should be the number of days left.
                     )
-                    .await
                     .expect("Error on sending email");
                 }
             }
