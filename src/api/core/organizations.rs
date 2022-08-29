@@ -339,11 +339,10 @@ async fn put_organization_sso(
     data: JsonUpcase<OrganizationSsoUpdateData>,
     conn: DbConn,
 ) -> JsonResult {
-    // let p: OrganizationSsoUpdateData = data;
-
     let p: OrganizationSsoUpdateData = data.into_inner().data;
     let d: SsoOrganizationData = p.Data.unwrap();
 
+    // TODO remove after debugging
     println!(
         "
     p.Enabled: {:?},
