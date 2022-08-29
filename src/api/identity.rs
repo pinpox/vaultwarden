@@ -610,40 +610,7 @@ struct ConnectData {
     org_identifier: Option<String>,
 }
 
-// TODO: https://github.com/SergioBenitez/Rocket/pull/1489#issuecomment-1114750006
-
-// impl<'f> FromForm<'f> for ConnectData {
-// type Error = String;
-
-// fn from_form(items: &mut FormItems<'f>, _strict: bool) -> Result<Self, Self::Error> {
-//     let mut form = Self::default();
-//     for item in items {
-//         let (key, value) = item.key_value_decoded();
-//         let mut normalized_key = key.to_lowercase();
-//         normalized_key.retain(|c| c != '_'); // Remove '_'
-
-//         match normalized_key.as_ref() {
-//             "granttype" => form.grant_type = value,
-//             "refreshtoken" => form.refresh_token = Some(value),
-//             "clientid" => form.client_id = Some(value),
-//             "password" => form.password = Some(value),
-//             "scope" => form.scope = Some(value),
-//             "username" => form.username = Some(value),
-//             "deviceidentifier" => form.device_identifier = Some(value),
-//             "devicename" => form.device_name = Some(value),
-//             "devicetype" => form.device_type = Some(value),
-//             "devicepushtoken" => form.device_push_token = Some(value),
-//             "twofactorprovider" => form.two_factor_provider = value.parse().ok(),
-//             "twofactortoken" => form.two_factor_token = Some(value),
-//             "twofactorremember" => form.two_factor_remember = value.parse().ok(),
-//             "code" => form.code = Some(value),
-//             "orgidentifier" => form.org_identifier = Some(value),
-//             key => warn!("Detected unexpected parameter during login: {}", key),
-//         }
-//     }
-//     Ok(form)
-// }
-// }
+// TODO Might need to migrate this: https://github.com/SergioBenitez/Rocket/pull/1489#issuecomment-1114750006
 
 fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
     if value.is_none() {
