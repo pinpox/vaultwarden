@@ -30,19 +30,14 @@ jobs:
       fail-fast: false
       matrix:
         channel:
-          - stable
-        target-triple:
-          - x86_64-unknown-linux-gnu
+          - "rust-toolchain" # The version defined in rust-toolchain
+          - "msrv" # The supported MSRV
         include:
-          - target-triple: x86_64-unknown-linux-gnu
-            host-triple: x86_64-unknown-linux-gnu
-            features: [sqlite,mysql,postgresql,enable_mimalloc] # Remember to update the `cargo test` to match the amount of features
-            channel: stable
-            os: ubuntu-20.04
-            ext: ""
+          - channel: "msrv"
+            version: "1.60.0"
 
-    name: Building ${{ matrix.channel }}-${{ matrix.target-triple }}
-    runs-on: ${{ matrix.os }}
+    name: Build and Test ${{ matrix.channel }}
+
     steps:
       # Checkout the repo
       - name: Checkout
@@ -77,6 +72,30 @@ jobs:
           target: ${{ matrix.target-triple }}
           components: clippy, rustfmt
       # End Uses the rust-toolchain file to determine version
+
+
+      # Install the MSRV channel to be used
+      - name: "Install MSRV version"
+        uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+        if: ${{ matrix.channel != 'rust-toolchain' }}
+        with:
+          profile: minimal
+          override: true
+          toolchain: ${{ matrix.version }}
+      # End Install the MSRV channel to be used
+
+
+      # Enable Rust Caching
+      - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
+      # End Enable Rust Caching
+
+
+      # Show environment
+      - name: "Show environment"
+        run: |
+          rustc -vV
+          cargo -vV
+      # End Show environment
 
 
       # Run cargo tests (In release mode to speed up future builds)
@@ -142,6 +161,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@6673cd052c4cd6fcf4b4e6e60ea986c889389535 # v3.0.0
         with:
-          name: vaultwarden-${{ matrix.target-triple }}${{ matrix.ext }}
-          path: target/${{ matrix.target-triple }}/release/vaultwarden${{ matrix.ext }}
+          name: vaultwarden
+          path: target/release/vaultwarden
       # End Upload artifact to Github Actions
