@@ -36,6 +36,9 @@ macro_rules! make_config {
         pub struct Config { inner: RwLock<Inner> }
 
         struct Inner {
+            rocket_shutdown_handle: Option<rocket::Shutdown>,
+            ws_shutdown_handle: Option<tokio::sync::oneshot::Sender<()>>,
+
             templates: Handlebars<'static>,
             config: ConfigItems,
 
@@ -56,13 +59,13 @@ macro_rules! make_config {
         impl ConfigBuilder {
             #[allow(clippy::field_reassign_with_default)]
             fn from_env() -> Self {
-                match dotenv::from_path(".env") {
+                match dotenvy::from_path(get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"))) {
                     Ok(_) => (),
                     Err(e) => match e {
-                        dotenv::Error::LineParse(msg, pos) => {
+                        dotenvy::Error::LineParse(msg, pos) => {
                             panic!("Error loading the .env file:\nNear {:?} on position {}\nPlease fix and restart!\n", msg, pos);
                         },
-                        dotenv::Error::Io(ioerr) => match ioerr.kind() {
+                        dotenvy::Error::Io(ioerr) => match ioerr.kind() {
                             std::io::ErrorKind::NotFound => {
                                 println!("[INFO] No .env file found.\n");
                             },
@@ -88,8 +91,7 @@ macro_rules! make_config {
             }
 
             fn from_file(path: &str) -> Result<Self, Error> {
-                use crate::util::read_file_string;
-                let config_str = read_file_string(path)?;
+                let config_str = std::fs::read_to_string(path)?;
                 serde_json::from_str(&config_str).map_err(Into::into)
             }
 
@@ -332,6 +334,8 @@ make_config! {
         attachments_folder:     String, false,  auto,   |c| format!("{}/{}", c.data_folder, "attachments");
         /// Sends folder
         sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
+        /// Temp folder |> Used for storing temporary file uploads
+        tmp_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
         /// Templates folder
         templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
         /// Session JWT key
@@ -406,9 +410,10 @@ make_config! {
         /// This setting applies globally to all users.
         incomplete_2fa_time_limit: i64, true,   def,    3;
 
-        /// Disable icon downloads |> Set to true to disable icon downloading, this would still serve icons from
-        /// $ICON_CACHE_FOLDER, but it won't produce any external network request. Needs to set $ICON_CACHE_TTL to 0,
-        /// otherwise it will delete them and they won't be downloaded again.
+        /// Disable icon downloads |> Set to true to disable icon downloading in the internal icon service.
+        /// This still serves existing icons from $ICON_CACHE_FOLDER, without generating any external
+        /// network requests. $ICON_CACHE_TTL must also be set to 0; otherwise, the existing icons
+        /// will be deleted eventually, but won't be downloaded again.
         disable_icon_download:  bool,   true,   def,    false;
         /// Allow new signups |> Controls whether new users can register. Users can be invited by the vaultwarden admin even if this is disabled
         signups_allowed:        bool,   true,   def,    true;
@@ -430,6 +435,8 @@ make_config! {
         /// Password iterations |> Number of server-side passwords hashing iterations.
         /// The changes only apply when a user changes their password. Not recommended to lower the value
         password_iterations:    i32,    true,   def,    100_000;
+        /// Allow password hints |> Controls whether users can set password hints. This setting applies globally to all users.
+        password_hints_allowed: bool,   true,   def,    true;
         /// Show password hint |> Controls whether a password hint should be shown directly in the web page
         /// if SMTP service is not configured. Not recommended for publicly-accessible instances as this
         /// provides unauthenticated access to potentially sensitive data.
@@ -449,6 +456,23 @@ make_config! {
         ip_header:              String, true,   def,    "X-Real-IP".to_string();
         /// Internal IP header property, used to avoid recomputing each time
         _ip_header_enabled:     bool,   false,  gen,    |c| &c.ip_header.trim().to_lowercase() != "none";
+        /// Icon service |> The predefined icon services are: internal, bitwarden, duckduckgo, google.
+        /// To specify a custom icon service, set a URL template with exactly one instance of `{}`,
+        /// which is replaced with the domain. For example: `https://icon.example.com/domain/{}`.
+        /// `internal` refers to Vaultwarden's built-in icon fetching implementation. If an external
+        /// service is set, an icon request to Vaultwarden will return an HTTP redirect to the
+        /// corresponding icon at the external service.
+        icon_service:           String, false,  def,    "internal".to_string();
+        /// Internal
+        _icon_service_url:      String, false,  gen,    |c| generate_icon_service_url(&c.icon_service);
+        /// Internal
+        _icon_service_csp:      String, false,  gen,    |c| generate_icon_service_csp(&c.icon_service, &c._icon_service_url);
+        /// Icon redirect code |> The HTTP status code to use for redirects to an external icon service.
+        /// The supported codes are 301 (legacy permanent), 302 (legacy temporary), 307 (temporary), and 308 (permanent).
+        /// Temporary redirects are useful while testing different icon services, but once a service
+        /// has been decided on, consider using permanent redirects for cacheability. The legacy codes
+        /// are currently better supported by the Bitwarden clients.
+        icon_redirect_code:     u32,    true,   def,    302;
         /// Positive icon cache expiry |> Number of seconds to consider that an already cached icon is fresh. After this period, the icon will be redownloaded
         icon_cache_ttl:         u64,    true,   def,    2_592_000;
         /// Negative icon cache expiry |> Number of seconds before trying to download an icon that failed again.
@@ -495,14 +519,30 @@ make_config! {
         /// Max database connection retries |> Number of times to retry the database connection during startup, with 1 second between each retry, set to 0 to retry indefinitely
         db_connection_retries:  u32,    false,  def,    15;
 
+        /// Timeout when aquiring database connection
+        database_timeout:       u64,    false,  def,    30;
+
         /// Database connection pool size
         database_max_conns:     u32,    false,  def,    10;
+
+        /// Database connection init |> SQL statements to run when creating a new database connection, mainly useful for connection-scoped pragmas. If empty, a database-specific default is used.
+        database_conn_init:     String, false,  def,    "".to_string();
 
         /// Bypass admin page security (Know the risks!) |> Disables the Admin Token for the admin page so you may use your own auth in-front
         disable_admin_token:    bool,   true,   def,    false;
 
         /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets
         allowed_iframe_ancestors: String, true, def,    String::new();
+
+        /// Seconds between login requests |> Number of seconds, on average, between login and 2FA requests from the same IP address before rate limiting kicks in
+        login_ratelimit_seconds:       u64, false, def, 60;
+        /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `login_ratelimit_seconds`. Note that this applies to both the login and the 2FA, so it's recommended to allow a burst size of at least 2
+        login_ratelimit_max_burst:     u32, false, def, 10;
+
+        /// Seconds between admin requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
+        admin_ratelimit_seconds:       u64, false, def, 300;
+        /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `admin_ratelimit_seconds`
+        admin_ratelimit_max_burst:     u32, false, def, 3;
     },
 
     /// Yubikey settings
@@ -537,12 +577,14 @@ make_config! {
         _enable_smtp:                  bool,   true,   def,     true;
         /// Host
         smtp_host:                     String, true,   option;
-        /// Enable Secure SMTP |> (Explicit) - Enabling this by default would use STARTTLS (Standard ports 587 or 25)
-        smtp_ssl:                      bool,   true,   def,     true;
-        /// Force TLS |> (Implicit) - Enabling this would force the use of an SSL/TLS connection, instead of upgrading an insecure one with STARTTLS (Standard port 465)
-        smtp_explicit_tls:             bool,   true,   def,     false;
+        /// DEPRECATED smtp_ssl |> DEPRECATED - Please use SMTP_SECURITY
+        smtp_ssl:                      bool,   false,  option;
+        /// DEPRECATED smtp_explicit_tls |> DEPRECATED - Please use SMTP_SECURITY
+        smtp_explicit_tls:             bool,   false,  option;
+        /// Secure SMTP |> ("starttls", "force_tls", "off") Enable a secure connection. Default is "starttls" (Explicit - ports 587 or 25), "force_tls" (Implicit - port 465) or "off", no encryption
+        smtp_security:                 String, true,   auto,    |c| smtp_convert_deprecated_ssl_options(c.smtp_ssl, c.smtp_explicit_tls); // TODO: After deprecation make it `def, "starttls".to_string()`
         /// Port
-        smtp_port:                     u16,    true,   auto,    |c| if c.smtp_explicit_tls {465} else if c.smtp_ssl {587} else {25};
+        smtp_port:                     u16,    true,   auto,    |c| if c.smtp_security == *"force_tls" {465} else if c.smtp_security == *"starttls" {587} else {25};
         /// From Address
         smtp_from:                     String, true,   def,     String::new();
         /// From Name
@@ -569,8 +611,8 @@ make_config! {
     email_2fa: _enable_email_2fa {
         /// Enabled |> Disabling will prevent users from setting up new email 2FA and using existing email 2FA configured
         _enable_email_2fa:      bool,   true,   auto,    |c| c._enable_smtp && c.smtp_host.is_some();
-        /// Email token size |> Number of digits in an email token (min: 6, max: 19). Note that the Bitwarden clients are hardcoded to mention 6 digit codes regardless of this setting.
-        email_token_size:       u32,    true,   def,      6;
+        /// Email token size |> Number of digits in an email 2FA token (min: 6, max: 255). Note that the Bitwarden clients are hardcoded to mention 6 digit codes regardless of this setting.
+        email_token_size:       u8,     true,   def,      6;
         /// Token expiration time |> Maximum time in seconds a token is valid. The time the user has to open email client and copy token.
         email_expiration_time:  u64,    true,   def,      600;
         /// Maximum attempts |> Maximum attempts before an email token is reset and a new email will need to be sent
@@ -625,6 +667,13 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     }
 
     if cfg._enable_smtp {
+        match cfg.smtp_security.as_str() {
+            "off" | "starttls" | "force_tls" => (),
+            _ => err!(
+                "`SMTP_SECURITY` is invalid. It needs to be one of the following options: starttls, force_tls or off"
+            ),
+        }
+
         if cfg.smtp_host.is_some() == cfg.smtp_from.is_empty() {
             err!("Both `SMTP_HOST` and `SMTP_FROM` need to be set for email support")
         }
@@ -644,10 +693,6 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         if cfg._enable_email_2fa && cfg.email_token_size < 6 {
             err!("`EMAIL_TOKEN_SIZE` has a minimum size of 6")
         }
-
-        if cfg._enable_email_2fa && cfg.email_token_size > 19 {
-            err!("`EMAIL_TOKEN_SIZE` has a maximum size of 19")
-        }
     }
 
     // Check if the icon blacklist regex is valid
@@ -657,6 +702,28 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
             Ok(_) => (),
             Err(e) => err!(format!("`ICON_BLACKLIST_REGEX` is invalid: {:#?}", e)),
         }
+    }
+
+    // Check if the icon service is valid
+    let icon_service = cfg.icon_service.as_str();
+    match icon_service {
+        "internal" | "bitwarden" | "duckduckgo" | "google" => (),
+        _ => {
+            if !icon_service.starts_with("http") {
+                err!(format!("Icon service URL `{}` must start with \"http\"", icon_service))
+            }
+            match icon_service.matches("{}").count() {
+                1 => (), // nominal
+                0 => err!(format!("Icon service URL `{}` has no placeholder \"{{}}\"", icon_service)),
+                _ => err!(format!("Icon service URL `{}` has more than one placeholder \"{{}}\"", icon_service)),
+            }
+        }
+    }
+
+    // Check if the icon redirect code is valid
+    match cfg.icon_redirect_code {
+        301 | 302 | 307 | 308 => (),
+        _ => err!("Only HTTP 301/302 and 307/308 redirects are supported"),
     }
 
     Ok(())
@@ -685,6 +752,48 @@ fn extract_url_path(url: &str) -> String {
     }
 }
 
+/// Generate the correct URL for the icon service.
+/// This will be used within icons.rs to call the external icon service.
+fn generate_icon_service_url(icon_service: &str) -> String {
+    match icon_service {
+        "internal" => "".to_string(),
+        "bitwarden" => "https://icons.bitwarden.net/{}/icon.png".to_string(),
+        "duckduckgo" => "https://icons.duckduckgo.com/ip3/{}.ico".to_string(),
+        "google" => "https://www.google.com/s2/favicons?domain={}&sz=32".to_string(),
+        _ => icon_service.to_string(),
+    }
+}
+
+/// Generate the CSP string needed to allow redirected icon fetching
+fn generate_icon_service_csp(icon_service: &str, icon_service_url: &str) -> String {
+    // We split on the first '{', since that is the variable delimiter for an icon service URL.
+    // Everything up until the first '{' should be fixed and can be used as an CSP string.
+    let csp_string = match icon_service_url.split_once('{') {
+        Some((c, _)) => c.to_string(),
+        None => "".to_string(),
+    };
+
+    // Because Google does a second redirect to there gstatic.com domain, we need to add an extra csp string.
+    match icon_service {
+        "google" => csp_string + " https://*.gstatic.com/favicon",
+        _ => csp_string,
+    }
+}
+
+/// Convert the old SMTP_SSL and SMTP_EXPLICIT_TLS options
+fn smtp_convert_deprecated_ssl_options(smtp_ssl: Option<bool>, smtp_explicit_tls: Option<bool>) -> String {
+    if smtp_explicit_tls.is_some() || smtp_ssl.is_some() {
+        println!("[DEPRECATED]: `SMTP_SSL` or `SMTP_EXPLICIT_TLS` is set. Please use `SMTP_SECURITY` instead.");
+    }
+    if smtp_explicit_tls.is_some() && smtp_explicit_tls.unwrap() {
+        return "force_tls".to_string();
+    } else if smtp_ssl.is_some() && !smtp_ssl.unwrap() {
+        return "off".to_string();
+    }
+    // Return the default `starttls` in all other cases
+    "starttls".to_string()
+}
+
 impl Config {
     pub fn load() -> Result<Self, Error> {
         // Loading from env and file
@@ -701,6 +810,8 @@ impl Config {
 
         Ok(Config {
             inner: RwLock::new(Inner {
+                rocket_shutdown_handle: None,
+                ws_shutdown_handle: None,
                 templates: load_templates(&config.templates_folder),
                 config,
                 _env,
@@ -865,6 +976,26 @@ impl Config {
             hb.render(name, data).map_err(Into::into)
         }
     }
+
+    pub fn set_rocket_shutdown_handle(&self, handle: rocket::Shutdown) {
+        self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
+    }
+
+    pub fn set_ws_shutdown_handle(&self, handle: tokio::sync::oneshot::Sender<()>) {
+        self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
+    }
+
+    pub fn shutdown(&self) {
+        if let Ok(mut c) = self.inner.write() {
+            if let Some(handle) = c.ws_shutdown_handle.take() {
+                handle.send(()).ok();
+            }
+
+            if let Some(handle) = c.rocket_shutdown_handle.take() {
+                handle.notify();
+            }
+        }
+    }
 }
 
 use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext, RenderError, Renderable};
@@ -938,7 +1069,7 @@ where
 
 fn case_helper<'reg, 'rc>(
     h: &Helper<'reg, 'rc>,
-    r: &'reg Handlebars,
+    r: &'reg Handlebars<'_>,
     ctx: &'rc Context,
     rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
@@ -955,17 +1086,16 @@ fn case_helper<'reg, 'rc>(
 
 fn js_escape_helper<'reg, 'rc>(
     h: &Helper<'reg, 'rc>,
-    _r: &'reg Handlebars,
+    _r: &'reg Handlebars<'_>,
     _ctx: &'rc Context,
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
+    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"jsesc\""))?;
 
     let no_quote = h.param(1).is_some();
 
-    let value =
-        param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
+    let value = param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"jsesc\" is not a String"))?;
 
     let mut escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
     if !no_quote {

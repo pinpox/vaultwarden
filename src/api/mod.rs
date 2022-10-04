@@ -5,11 +5,12 @@ mod identity;
 mod notifications;
 mod web;
 
-use rocket_contrib::json::Json;
+use rocket::serde::json::Json;
 use serde_json::Value;
 
 pub use crate::api::{
     admin::routes as admin_routes,
+    core::catchers as core_catchers,
     core::purge_sends,
     core::purge_trashed_ciphers,
     core::routes as core_routes,
@@ -19,6 +20,7 @@ pub use crate::api::{
     identity::routes as identity_routes,
     notifications::routes as notifications_routes,
     notifications::{start_notification_server, Notify, UpdateType},
+    web::catchers as web_catchers,
     web::routes as web_routes,
 };
 use crate::util;

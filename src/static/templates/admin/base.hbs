@@ -4,9 +4,9 @@
     <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
     <meta name="robots" content="noindex,nofollow" />
-    <link rel="icon" type="image/png" href="{{urlpath}}/bwrs_static/vaultwarden-icon.png">
+    <link rel="icon" type="image/png" href="{{urlpath}}/vw_static/vaultwarden-icon.png">
     <title>Vaultwarden Admin Panel</title>
-    <link rel="stylesheet" href="{{urlpath}}/bwrs_static/bootstrap.css" />
+    <link rel="stylesheet" href="{{urlpath}}/vw_static/bootstrap.css" />
     <style>
         body {
             padding-top: 75px;
@@ -20,8 +20,15 @@
             width: auto;
             margin: -5px 0 0 0;
         }
+        /* Special alert-row class to use Bootstrap v5.2+ variable colors */
+        .alert-row {
+            --bs-alert-border: 1px solid var(--bs-alert-border-color);
+            color: var(--bs-alert-color);
+            background-color: var(--bs-alert-bg);
+            border: var(--bs-alert-border);
+        }
     </style>
-    <script src="{{urlpath}}/bwrs_static/identicon.js"></script>
+    <script src="{{urlpath}}/vw_static/identicon.js"></script>
     <script>
         'use strict';
 
@@ -85,7 +92,7 @@
 <body class="bg-light">
     <nav class="navbar navbar-expand-md navbar-dark bg-dark mb-4 shadow fixed-top">
         <div class="container-xl">
-            <a class="navbar-brand" href="{{urlpath}}/admin"><img class="vaultwarden-icon" src="{{urlpath}}/bwrs_static/vaultwarden-icon.png" alt="V">aultwarden Admin</a>
+            <a class="navbar-brand" href="{{urlpath}}/admin"><img class="vaultwarden-icon" src="{{urlpath}}/vw_static/vaultwarden-icon.png" alt="V">aultwarden Admin</a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse"
                     aria-controls="navbarCollapse" aria-expanded="false" aria-label="Toggle navigation">
                 <span class="navbar-toggler-icon"></span>
@@ -135,6 +142,6 @@
             }
         })();
     </script>
-    <script src="{{urlpath}}/bwrs_static/bootstrap-native.js"></script>
+    <script src="{{urlpath}}/vw_static/bootstrap-native.js"></script>
 </body>
 </html>

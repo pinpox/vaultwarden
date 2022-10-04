@@ -16,21 +16,20 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.24.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.24.1
-#     [vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b]
+#     $ docker pull vaultwarden/web-vault:v2022.9.0
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2022.9.0
+#     [vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
-#     [vaultwarden/web-vault:v2.24.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc
+#     [vaultwarden/web-vault:v2022.9.0]
 #
-FROM vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b as vault
+FROM vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.55-buster as build
+FROM rust:1.64-bullseye as build
 
-# Debian-based builds support multidb
-ARG DB=sqlite,mysql,postgresql
+
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -64,6 +63,9 @@ COPY ./rust-toolchain ./rust-toolchain
 COPY ./build.rs ./build.rs
 
 
+# Configure the DB ARG as late as possible to not invalidate the cached layers above
+ARG DB=sqlite,mysql,postgresql
+
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
@@ -79,16 +81,17 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
+# hadolint ignore=DL3059
 RUN cargo build --features ${DB} --release
 
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM debian:buster-slim
+FROM debian:bullseye-slim
 
-ENV ROCKET_ENV "staging"
-ENV ROCKET_PORT=80
-ENV ROCKET_WORKERS=10
+ENV ROCKET_PROFILE="release" \
+    ROCKET_ADDRESS=0.0.0.0 \
+    ROCKET_PORT=80
 
 
 # Create data folder and Install needed libraries
@@ -98,7 +101,6 @@ RUN mkdir /data \
     openssl \
     ca-certificates \
     curl \
-    dumb-init \
     libmariadb-dev-compat \
     libpq5 \
     && apt-get clean \
@@ -112,7 +114,6 @@ EXPOSE 3012
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
 WORKDIR /
-COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
 COPY --from=build /app/target/release/vaultwarden .
 
@@ -121,6 +122,4 @@ COPY docker/start.sh /start.sh
 
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
-# Configures the startup!
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]

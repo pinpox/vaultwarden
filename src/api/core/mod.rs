@@ -1,4 +1,4 @@
-mod accounts;
+pub mod accounts;
 mod ciphers;
 mod emergency_access;
 mod folders;
@@ -7,13 +7,16 @@ mod sends;
 pub mod two_factor;
 
 pub use ciphers::purge_trashed_ciphers;
+pub use ciphers::{CipherSyncData, CipherSyncType};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use sends::purge_sends;
 pub use two_factor::send_incomplete_2fa_notifications;
 
 pub fn routes() -> Vec<Route> {
-    let mut mod_routes =
-        routes![clear_device_token, put_device_token, get_eq_domains, post_eq_domains, put_eq_domains, hibp_breach,];
+    let mut device_token_routes = routes![clear_device_token, put_device_token];
+    let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
+    let mut hibp_routes = routes![hibp_breach];
+    let mut meta_routes = routes![alive, now, version, config];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -23,7 +26,10 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut organizations::routes());
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
-    routes.append(&mut mod_routes);
+    routes.append(&mut device_token_routes);
+    routes.append(&mut eq_domains_routes);
+    routes.append(&mut hibp_routes);
+    routes.append(&mut meta_routes);
 
     routes
 }
@@ -31,8 +37,9 @@ pub fn routes() -> Vec<Route> {
 //
 // Move this somewhere else
 //
+use rocket::serde::json::Json;
+use rocket::Catcher;
 use rocket::Route;
-use rocket_contrib::json::Json;
 use serde_json::Value;
 
 use crate::{
@@ -121,7 +128,7 @@ struct EquivDomainData {
 }
 
 #[post("/settings/domains", data = "<data>")]
-fn post_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn post_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: EquivDomainData = data.into_inner().data;
 
     let excluded_globals = data.ExcludedGlobalEquivalentDomains.unwrap_or_default();
@@ -133,18 +140,18 @@ fn post_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: Db
     user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
     user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
 
-    user.save(&conn)?;
+    user.save(&conn).await?;
 
     Ok(Json(json!({})))
 }
 
 #[put("/settings/domains", data = "<data>")]
-fn put_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbConn) -> JsonResult {
-    post_eq_domains(data, headers, conn)
+async fn put_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbConn) -> JsonResult {
+    post_eq_domains(data, headers, conn).await
 }
 
 #[get("/hibp/breach?<username>")]
-fn hibp_breach(username: String) -> JsonResult {
+async fn hibp_breach(username: String) -> JsonResult {
     let url = format!(
         "https://haveibeenpwned.com/api/v3/breachedaccount/{}?truncateResponse=false&includeUnverified=false",
         username
@@ -153,14 +160,14 @@ fn hibp_breach(username: String) -> JsonResult {
     if let Some(api_key) = crate::CONFIG.hibp_api_key() {
         let hibp_client = get_reqwest_client();
 
-        let res = hibp_client.get(&url).header("hibp-api-key", api_key).send()?;
+        let res = hibp_client.get(&url).header("hibp-api-key", api_key).send().await?;
 
         // If we get a 404, return a 404, it means no breached accounts
         if res.status() == 404 {
             return Err(Error::empty().with_code(404));
         }
 
-        let value: Value = res.error_for_status()?.json()?;
+        let value: Value = res.error_for_status()?.json().await?;
         Ok(Json(value))
     } else {
         Ok(Json(json!([{
@@ -170,11 +177,62 @@ fn hibp_breach(username: String) -> JsonResult {
             "BreachDate": "2019-08-18T00:00:00Z",
             "AddedDate": "2019-08-18T00:00:00Z",
             "Description": format!("Go to: <a href=\"https://haveibeenpwned.com/account/{account}\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/account/{account}</a> for a manual check.<br/><br/>HaveIBeenPwned API key not set!<br/>Go to <a href=\"https://haveibeenpwned.com/API/Key\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/API/Key</a> to purchase an API key from HaveIBeenPwned.<br/><br/>", account=username),
-            "LogoPath": "bwrs_static/hibp.png",
+            "LogoPath": "vw_static/hibp.png",
             "PwnCount": 0,
             "DataClasses": [
                 "Error - No API key set!"
             ]
         }])))
     }
+}
+
+// We use DbConn here to let the alive healthcheck also verify the database connection.
+#[get("/alive")]
+fn alive(_conn: DbConn) -> Json<String> {
+    now()
+}
+
+#[get("/now")]
+pub fn now() -> Json<String> {
+    Json(crate::util::format_date(&chrono::Utc::now().naive_utc()))
+}
+
+#[get("/version")]
+fn version() -> Json<&'static str> {
+    Json(crate::VERSION.unwrap_or_default())
+}
+
+#[get("/config")]
+fn config() -> Json<Value> {
+    let domain = crate::CONFIG.domain();
+    Json(json!({
+        "version": crate::VERSION,
+        "gitHash": option_env!("GIT_REV"),
+        "server": {
+          "name": "Vaultwarden",
+          "url": "https://github.com/dani-garcia/vaultwarden"
+        },
+        "environment": {
+          "vault": domain,
+          "api": format!("{domain}/api"),
+          "identity": format!("{domain}/identity"),
+          "notifications": format!("{domain}/notifications"),
+          "sso": "",
+        },
+    }))
+}
+
+pub fn catchers() -> Vec<Catcher> {
+    catchers![api_not_found]
+}
+
+#[catch(404)]
+fn api_not_found() -> Json<Value> {
+    Json(json!({
+        "error": {
+            "code": 404,
+            "reason": "Not Found",
+            "description": "The requested resource could not be found."
+        }
+    }))
 }
