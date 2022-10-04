@@ -171,7 +171,7 @@ impl User {
     pub fn set_stamp_exception(&mut self, route_exception: Vec<String>) {
         let stamp_exception = UserStampException {
             routes: route_exception,
-            security_stamp: self.security_stamp.to_string(),
+            security_stamp: self.security_stamp.clone(),
             expire: (Utc::now().naive_utc() + Duration::minutes(2)).timestamp(),
         };
         self.stamp_exception = Some(serde_json::to_string(&stamp_exception).unwrap_or_default());
@@ -275,11 +275,11 @@ impl User {
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         for user_org in UserOrganization::find_confirmed_by_user(&self.uuid, conn).await {
-            if user_org.atype == UserOrgType::Owner {
-                let owner_type = UserOrgType::Owner as i32;
-                if UserOrganization::find_by_org_and_type(&user_org.org_uuid, owner_type, conn).await.len() <= 1 {
-                    err!("Can't delete last owner")
-                }
+            if user_org.atype == UserOrgType::Owner
+                && UserOrganization::count_confirmed_by_org_and_type(&user_org.org_uuid, UserOrgType::Owner, conn).await
+                    <= 1
+            {
+                err!("Can't delete last owner")
             }
         }
 

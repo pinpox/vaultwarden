@@ -7,7 +7,7 @@ mod sends;
 pub mod two_factor;
 
 pub use ciphers::purge_trashed_ciphers;
-pub use ciphers::CipherSyncData;
+pub use ciphers::{CipherSyncData, CipherSyncType};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use sends::purge_sends;
 pub use two_factor::send_incomplete_2fa_notifications;
@@ -16,7 +16,7 @@ pub fn routes() -> Vec<Route> {
     let mut device_token_routes = routes![clear_device_token, put_device_token];
     let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
     let mut hibp_routes = routes![hibp_breach];
-    let mut meta_routes = routes![alive, now, version];
+    let mut meta_routes = routes![alive, now, version, config];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -38,6 +38,7 @@ pub fn routes() -> Vec<Route> {
 // Move this somewhere else
 //
 use rocket::serde::json::Json;
+use rocket::Catcher;
 use rocket::Route;
 use serde_json::Value;
 
@@ -199,4 +200,39 @@ pub fn now() -> Json<String> {
 #[get("/version")]
 fn version() -> Json<&'static str> {
     Json(crate::VERSION.unwrap_or_default())
+}
+
+#[get("/config")]
+fn config() -> Json<Value> {
+    let domain = crate::CONFIG.domain();
+    Json(json!({
+        "version": crate::VERSION,
+        "gitHash": option_env!("GIT_REV"),
+        "server": {
+          "name": "Vaultwarden",
+          "url": "https://github.com/dani-garcia/vaultwarden"
+        },
+        "environment": {
+          "vault": domain,
+          "api": format!("{domain}/api"),
+          "identity": format!("{domain}/identity"),
+          "notifications": format!("{domain}/notifications"),
+          "sso": "",
+        },
+    }))
+}
+
+pub fn catchers() -> Vec<Catcher> {
+    catchers![api_not_found]
+}
+
+#[catch(404)]
+fn api_not_found() -> Json<Value> {
+    Json(json!({
+        "error": {
+            "code": 404,
+            "reason": "Not Found",
+            "description": "The requested resource could not be found."
+        }
+    }))
 }

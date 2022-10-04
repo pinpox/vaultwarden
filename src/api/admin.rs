@@ -7,8 +7,8 @@ use rocket::serde::json::Json;
 use rocket::{
     form::Form,
     http::{Cookie, CookieJar, SameSite, Status},
-    request::{self, FlashMessage, FromRequest, Outcome, Request},
-    response::{content::RawHtml as Html, Flash, Redirect},
+    request::{self, FromRequest, Outcome, Request},
+    response::{content::RawHtml as Html, Redirect},
     Route,
 };
 
@@ -79,6 +79,7 @@ fn admin_disabled() -> &'static str {
 
 const COOKIE_NAME: &str = "VW_ADMIN";
 const ADMIN_PATH: &str = "/admin";
+const DT_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
 
 const BASE_TEMPLATE: &str = "admin/base";
 
@@ -140,10 +141,24 @@ fn admin_url(referer: Referer) -> String {
     }
 }
 
+#[derive(Responder)]
+enum AdminResponse {
+    #[response(status = 200)]
+    Ok(ApiResult<Html<String>>),
+    #[response(status = 401)]
+    Unauthorized(ApiResult<Html<String>>),
+    #[response(status = 429)]
+    TooManyRequests(ApiResult<Html<String>>),
+}
+
 #[get("/", rank = 2)]
-fn admin_login(flash: Option<FlashMessage<'_>>) -> ApiResult<Html<String>> {
+fn admin_login() -> ApiResult<Html<String>> {
+    render_admin_login(None)
+}
+
+fn render_admin_login(msg: Option<&str>) -> ApiResult<Html<String>> {
     // If there is an error, show it
-    let msg = flash.map(|msg| format!("{}: {}", msg.kind(), msg.message()));
+    let msg = msg.map(|msg| format!("Error: {msg}"));
     let json = json!({
         "page_content": "admin/login",
         "version": VERSION,
@@ -162,22 +177,17 @@ struct LoginForm {
 }
 
 #[post("/", data = "<data>")]
-fn post_admin_login(
-    data: Form<LoginForm>,
-    cookies: &CookieJar<'_>,
-    ip: ClientIp,
-    referer: Referer,
-) -> Result<Redirect, Flash<Redirect>> {
+fn post_admin_login(data: Form<LoginForm>, cookies: &CookieJar<'_>, ip: ClientIp) -> AdminResponse {
     let data = data.into_inner();
 
     if crate::ratelimit::check_limit_admin(&ip.ip).is_err() {
-        return Err(Flash::error(Redirect::to(admin_url(referer)), "Too many requests, try again later."));
+        return AdminResponse::TooManyRequests(render_admin_login(Some("Too many requests, try again later.")));
     }
 
     // If the token is invalid, redirect to login page
     if !_validate_token(&data.token) {
         error!("Invalid admin token. IP: {}", ip.ip);
-        Err(Flash::error(Redirect::to(admin_url(referer)), "Invalid admin token, please try again."))
+        AdminResponse::Unauthorized(render_admin_login(Some("Invalid admin token, please try again.")))
     } else {
         // If the token received is valid, generate JWT and save it as a cookie
         let claims = generate_admin_claims();
@@ -191,7 +201,7 @@ fn post_admin_login(
             .finish();
 
         cookies.add(cookie);
-        Ok(Redirect::to(admin_url(referer)))
+        AdminResponse::Ok(render_admin_page())
     }
 }
 
@@ -243,10 +253,14 @@ impl AdminTemplateData {
     }
 }
 
-#[get("/", rank = 1)]
-fn admin_page(_token: AdminToken) -> ApiResult<Html<String>> {
+fn render_admin_page() -> ApiResult<Html<String>> {
     let text = AdminTemplateData::new().render()?;
     Ok(Html(text))
+}
+
+#[get("/", rank = 1)]
+fn admin_page(_token: AdminToken) -> ApiResult<Html<String>> {
+    render_admin_page()
 }
 
 #[derive(Deserialize, Debug)]
@@ -275,7 +289,7 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
 
     async fn _generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
-            mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None)
+            mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None).await
         } else {
             let invitation = Invitation::new(user.email.clone());
             invitation.save(conn).await
@@ -289,11 +303,11 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
 }
 
 #[post("/test/smtp", data = "<data>")]
-fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
+async fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
     let data: InviteData = data.into_inner();
 
     if CONFIG.mail_enabled() {
-        mail::send_test(&data.email)
+        mail::send_test(&data.email).await
     } else {
         err!("Mail is not enabled")
     }
@@ -302,7 +316,7 @@ fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
 #[get("/logout")]
 fn logout(cookies: &CookieJar<'_>, referer: Referer) -> Redirect {
     cookies.remove(Cookie::build(COOKIE_NAME, "").path(admin_path()).finish());
-    Redirect::to(admin_url(referer))
+    Redirect::temporary(admin_url(referer))
 }
 
 #[get("/users")]
@@ -310,7 +324,10 @@ async fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
     let users_json = stream::iter(User::get_all(&conn).await)
         .then(|u| async {
             let u = u; // Move out this single variable
-            u.to_json(&conn).await
+            let mut usr = u.to_json(&conn).await;
+            usr["UserEnabled"] = json!(u.enabled);
+            usr["CreatedAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
+            usr
         })
         .collect::<Vec<Value>>()
         .await;
@@ -320,8 +337,6 @@ async fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
 
 #[get("/users/overview")]
 async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
-    const DT_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
-
     let users_json = stream::iter(User::get_all(&conn).await)
         .then(|u| async {
             let u = u; // Move out this single variable
@@ -346,9 +361,11 @@ async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<Stri
 
 #[get("/users/<uuid>")]
 async fn get_user_json(uuid: String, _token: AdminToken, conn: DbConn) -> JsonResult {
-    let user = get_user_or_404(&uuid, &conn).await?;
-
-    Ok(Json(user.to_json(&conn).await))
+    let u = get_user_or_404(&uuid, &conn).await?;
+    let mut usr = u.to_json(&conn).await;
+    usr["UserEnabled"] = json!(u.enabled);
+    usr["CreatedAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
+    Ok(Json(usr))
 }
 
 #[post("/users/<uuid>/delete")]
@@ -414,16 +431,27 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, c
     };
 
     if user_to_edit.atype == UserOrgType::Owner && new_type != UserOrgType::Owner {
-        // Removing owner permmission, check that there are at least another owner
-        let num_owners =
-            UserOrganization::find_by_org_and_type(&data.org_uuid, UserOrgType::Owner as i32, &conn).await.len();
-
-        if num_owners <= 1 {
+        // Removing owner permmission, check that there is at least one other confirmed owner
+        if UserOrganization::count_confirmed_by_org_and_type(&data.org_uuid, UserOrgType::Owner, &conn).await <= 1 {
             err!("Can't change the type of the last owner")
         }
     }
 
-    user_to_edit.atype = new_type as i32;
+    // This check is also done at api::organizations::{accept_invite(), _confirm_invite, _activate_user(), edit_user()}, update_user_org_type
+    // It returns different error messages per function.
+    if new_type < UserOrgType::Admin {
+        match OrgPolicy::is_user_allowed(&user_to_edit.user_uuid, &user_to_edit.org_uuid, true, &conn).await {
+            Ok(_) => {}
+            Err(OrgPolicyErr::TwoFactorMissing) => {
+                err!("You cannot modify this user to this type because it has no two-step login method activated");
+            }
+            Err(OrgPolicyErr::SingleOrgEnforced) => {
+                err!("You cannot modify this user to this type because it is a member of an organization which forbids it");
+            }
+        }
+    }
+
+    user_to_edit.atype = new_type;
     user_to_edit.save(&conn).await
 }
 
@@ -487,41 +515,13 @@ async fn has_http_access() -> bool {
     }
 }
 
-#[get("/diagnostics")]
-async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
-    use crate::util::read_file_string;
-    use chrono::prelude::*;
-    use std::net::ToSocketAddrs;
-
-    // Get current running versions
-    let web_vault_version: WebVaultVersion =
-        match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "vw-version.json")) {
-            Ok(s) => serde_json::from_str(&s)?,
-            _ => match read_file_string(&format!("{}/{}", CONFIG.web_vault_folder(), "version.json")) {
-                Ok(s) => serde_json::from_str(&s)?,
-                _ => WebVaultVersion {
-                    version: String::from("Version file missing"),
-                },
-            },
-        };
-
-    // Execute some environment checks
-    let running_within_docker = is_running_in_docker();
-    let has_http_access = has_http_access().await;
-    let uses_proxy = env::var_os("HTTP_PROXY").is_some()
-        || env::var_os("http_proxy").is_some()
-        || env::var_os("HTTPS_PROXY").is_some()
-        || env::var_os("https_proxy").is_some();
-
-    // Check if we are able to resolve DNS entries
-    let dns_resolved = match ("github.com", 0).to_socket_addrs().map(|mut i| i.next()) {
-        Ok(Some(a)) => a.ip().to_string(),
-        _ => "Could not resolve domain name.".to_string(),
-    };
-
+use cached::proc_macro::cached;
+/// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already.
+/// It will cache this function for 300 seconds (5 minutes) which should prevent the exhaustion of the rate limit.
+#[cached(time = 300, sync_writes = true)]
+async fn get_release_info(has_http_access: bool, running_within_docker: bool) -> (String, String, String) {
     // If the HTTP Check failed, do not even attempt to check for new versions since we were not able to connect with github.com anyway.
-    // TODO: Maybe we need to cache this using a LazyStatic or something. Github only allows 60 requests per hour, and we use 3 here already.
-    let (latest_release, latest_commit, latest_web_build) = if has_http_access {
+    if has_http_access {
         (
             match get_github_api::<GitRelease>("https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest")
                 .await
@@ -554,7 +554,42 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> A
         )
     } else {
         ("-".to_string(), "-".to_string(), "-".to_string())
+    }
+}
+
+#[get("/diagnostics")]
+async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
+    use chrono::prelude::*;
+    use std::net::ToSocketAddrs;
+
+    // Get current running versions
+    let web_vault_version: WebVaultVersion =
+        match std::fs::read_to_string(&format!("{}/{}", CONFIG.web_vault_folder(), "vw-version.json")) {
+            Ok(s) => serde_json::from_str(&s)?,
+            _ => match std::fs::read_to_string(&format!("{}/{}", CONFIG.web_vault_folder(), "version.json")) {
+                Ok(s) => serde_json::from_str(&s)?,
+                _ => WebVaultVersion {
+                    version: String::from("Version file missing"),
+                },
+            },
+        };
+
+    // Execute some environment checks
+    let running_within_docker = is_running_in_docker();
+    let has_http_access = has_http_access().await;
+    let uses_proxy = env::var_os("HTTP_PROXY").is_some()
+        || env::var_os("http_proxy").is_some()
+        || env::var_os("HTTPS_PROXY").is_some()
+        || env::var_os("https_proxy").is_some();
+
+    // Check if we are able to resolve DNS entries
+    let dns_resolved = match ("github.com", 0).to_socket_addrs().map(|mut i| i.next()) {
+        Ok(Some(a)) => a.ip().to_string(),
+        _ => "Could not resolve domain name.".to_string(),
     };
+
+    let (latest_release, latest_commit, latest_web_build) =
+        get_release_info(has_http_access, running_within_docker).await;
 
     let ip_header_name = match &ip_header.0 {
         Some(h) => h,

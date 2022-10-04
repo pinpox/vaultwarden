@@ -5,12 +5,14 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::CipherSyncData, EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData,
-        UpdateType,
+        core::{CipherSyncData, CipherSyncType},
+        EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType,
     },
     auth::{decode_invite, AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OwnerHeaders},
     db::{models::*, DbConn},
-    mail, CONFIG,
+    mail,
+    util::convert_json_key_lcase_first,
+    CONFIG,
 };
 
 use futures::{stream, stream::StreamExt};
@@ -63,6 +65,15 @@ pub fn routes() -> Vec<Route> {
         import,
         post_org_keys,
         bulk_public_keys,
+        deactivate_organization_user,
+        bulk_deactivate_organization_user,
+        revoke_organization_user,
+        bulk_revoke_organization_user,
+        activate_organization_user,
+        bulk_activate_organization_user,
+        restore_organization_user,
+        bulk_restore_organization_user,
+        get_org_export
     ]
 }
 
@@ -200,7 +211,7 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, conn: 
     if !CONFIG.is_org_creation_allowed(&headers.user.email) {
         err!("User not allowed to create organizations")
     }
-    if OrgPolicy::is_applicable_to_user(&headers.user.uuid, OrgPolicyType::SingleOrg, &conn).await {
+    if OrgPolicy::is_applicable_to_user(&headers.user.uuid, OrgPolicyType::SingleOrg, None, &conn).await {
         err!(
             "You may not create an organization. You belong to an organization which has a policy that prohibits you from being a member of any other organization."
         )
@@ -267,13 +278,10 @@ async fn leave_organization(org_id: String, headers: Headers, conn: DbConn) -> E
     match UserOrganization::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await {
         None => err!("User not part of organization"),
         Some(user_org) => {
-            if user_org.atype == UserOrgType::Owner {
-                let num_owners =
-                    UserOrganization::find_by_org_and_type(&org_id, UserOrgType::Owner as i32, &conn).await.len();
-
-                if num_owners <= 1 {
-                    err!("The last owner can't leave")
-                }
+            if user_org.atype == UserOrgType::Owner
+                && UserOrganization::count_confirmed_by_org_and_type(&org_id, UserOrgType::Owner, &conn).await <= 1
+            {
+                err!("The last owner can't leave")
             }
 
             user_org.delete(&conn).await
@@ -448,15 +456,19 @@ async fn get_user_collections(headers: Headers, conn: DbConn) -> Json<Value> {
 
 #[get("/organizations/<org_id>/collections")]
 async fn get_org_collections(org_id: String, _headers: ManagerHeadersLoose, conn: DbConn) -> Json<Value> {
-    Json(json!({
+    Json(_get_org_collections(&org_id, &conn).await)
+}
+
+async fn _get_org_collections(org_id: &str, conn: &DbConn) -> Value {
+    json!({
         "Data":
-            Collection::find_by_organization(&org_id, &conn).await
+            Collection::find_by_organization(org_id, conn).await
             .iter()
             .map(Collection::to_json)
             .collect::<Value>(),
         "Object": "list",
         "ContinuationToken": null,
-    }))
+    })
 }
 
 #[post("/organizations/<org_id>/collections", data = "<data>")]
@@ -693,22 +705,26 @@ struct OrgIdData {
 
 #[get("/ciphers/organization-details?<data..>")]
 async fn get_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> Json<Value> {
-    let ciphers = Cipher::find_by_org(&data.organization_id, &conn).await;
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, &ciphers, &conn).await;
+    Json(_get_org_details(&data.organization_id, &headers.host, &headers.user.uuid, &conn).await)
+}
+
+async fn _get_org_details(org_id: &str, host: &str, user_uuid: &str, conn: &DbConn) -> Value {
+    let ciphers = Cipher::find_by_org(org_id, conn).await;
+    let cipher_sync_data = CipherSyncData::new(user_uuid, &ciphers, CipherSyncType::Organization, conn).await;
 
     let ciphers_json = stream::iter(ciphers)
         .then(|c| async {
             let c = c; // Move out this single variable
-            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), &conn).await
+            c.to_json(host, user_uuid, Some(&cipher_sync_data), conn).await
         })
         .collect::<Vec<Value>>()
         .await;
 
-    Json(json!({
+    json!({
       "Data": ciphers_json,
       "Object": "list",
       "ContinuationToken": null,
-    }))
+    })
 }
 
 #[get("/organizations/<org_id>/users")]
@@ -859,7 +875,8 @@ async fn send_invite(org_id: String, data: JsonUpcase<InviteData>, headers: Admi
                 Some(new_user.uuid),
                 &org_name,
                 Some(headers.user.email.clone()),
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -939,7 +956,8 @@ async fn _reinvite_user(org_id: &str, user_org: &str, invited_by_email: &str, co
             Some(user_org.uuid),
             &org_name,
             Some(invited_by_email.to_string()),
-        )?;
+        )
+        .await?;
     } else {
         let invitation = Invitation::new(user.email);
         invitation.save(conn).await?;
@@ -954,17 +972,16 @@ struct AcceptData {
     Token: String,
 }
 
-#[post("/organizations/<_org_id>/users/<_org_user_id>/accept", data = "<data>")]
+#[post("/organizations/<org_id>/users/<_org_user_id>/accept", data = "<data>")]
 async fn accept_invite(
-    _org_id: String,
+    org_id: String,
     _org_user_id: String,
     data: JsonUpcase<AcceptData>,
     conn: DbConn,
 ) -> EmptyResult {
     // The web-vault passes org_id and org_user_id in the URL, but we are just reading them from the JWT instead
     let data: AcceptData = data.into_inner().data;
-    let token = &data.Token;
-    let claims = decode_invite(token)?;
+    let claims = decode_invite(&data.Token)?;
 
     match User::find_by_mail(&claims.email, &conn).await {
         Some(_) => {
@@ -980,44 +997,18 @@ async fn accept_invite(
                     err!("User already accepted the invitation")
                 }
 
-                let user_twofactor_disabled = TwoFactor::find_by_user(&user_org.user_uuid, &conn).await.is_empty();
-
-                let policy = OrgPolicyType::TwoFactorAuthentication as i32;
-                let org_twofactor_policy_enabled =
-                    match OrgPolicy::find_by_org_and_type(&user_org.org_uuid, policy, &conn).await {
-                        Some(p) => p.enabled,
-                        None => false,
-                    };
-
-                if org_twofactor_policy_enabled && user_twofactor_disabled {
-                    err!("You cannot join this organization until you enable two-step login on your user account.")
-                }
-
-                // Enforce Single Organization Policy of organization user is trying to join
-                let single_org_policy_enabled =
-                    match OrgPolicy::find_by_org_and_type(&user_org.org_uuid, OrgPolicyType::SingleOrg as i32, &conn)
-                        .await
-                    {
-                        Some(p) => p.enabled,
-                        None => false,
-                    };
-                if single_org_policy_enabled && user_org.atype < UserOrgType::Admin {
-                    let is_member_of_another_org = UserOrganization::find_any_state_by_user(&user_org.user_uuid, &conn)
-                        .await
-                        .into_iter()
-                        .filter(|uo| uo.org_uuid != user_org.org_uuid)
-                        .count()
-                        > 1;
-                    if is_member_of_another_org {
-                        err!("You may not join this organization until you leave or remove all other organizations.")
+                // This check is also done at accept_invite(), _confirm_invite, _activate_user(), edit_user(), admin::update_user_org_type
+                // It returns different error messages per function.
+                if user_org.atype < UserOrgType::Admin {
+                    match OrgPolicy::is_user_allowed(&user_org.user_uuid, &org_id, false, &conn).await {
+                        Ok(_) => {}
+                        Err(OrgPolicyErr::TwoFactorMissing) => {
+                            err!("You cannot join this organization until you enable two-step login on your user account");
+                        }
+                        Err(OrgPolicyErr::SingleOrgEnforced) => {
+                            err!("You cannot join this organization because you are a member of an organization which forbids it");
+                        }
                     }
-                }
-
-                // Enforce Single Organization Policy of other organizations user is a member of
-                if OrgPolicy::is_applicable_to_user(&user_org.user_uuid, OrgPolicyType::SingleOrg, &conn).await {
-                    err!(
-                        "You cannot join this organization because you are a member of an organization which forbids it"
-                    )
                 }
 
                 user_org.status = UserOrgStatus::Accepted as i32;
@@ -1037,10 +1028,10 @@ async fn accept_invite(
         };
         if let Some(invited_by_email) = &claims.invited_by_email {
             // User was invited to an organization, so they must be confirmed manually after acceptance
-            mail::send_invite_accepted(&claims.email, invited_by_email, &org_name)?;
+            mail::send_invite_accepted(&claims.email, invited_by_email, &org_name).await?;
         } else {
             // User was invited from /admin, so they are automatically confirmed
-            mail::send_invite_confirmed(&claims.email, &org_name)?;
+            mail::send_invite_confirmed(&claims.email, &org_name).await?;
         }
     }
 
@@ -1123,6 +1114,20 @@ async fn _confirm_invite(
         err!("User in invalid state")
     }
 
+    // This check is also done at accept_invite(), _confirm_invite, _activate_user(), edit_user(), admin::update_user_org_type
+    // It returns different error messages per function.
+    if user_to_confirm.atype < UserOrgType::Admin {
+        match OrgPolicy::is_user_allowed(&user_to_confirm.user_uuid, org_id, true, conn).await {
+            Ok(_) => {}
+            Err(OrgPolicyErr::TwoFactorMissing) => {
+                err!("You cannot confirm this user because it has no two-step login method activated");
+            }
+            Err(OrgPolicyErr::SingleOrgEnforced) => {
+                err!("You cannot confirm this user because it is a member of an organization which forbids it");
+            }
+        }
+    }
+
     user_to_confirm.status = UserOrgStatus::Confirmed as i32;
     user_to_confirm.akey = key.to_string();
 
@@ -1135,7 +1140,7 @@ async fn _confirm_invite(
             Some(user) => user.email,
             None => err!("Error looking up user."),
         };
-        mail::send_invite_confirmed(&address, &org_name)?;
+        mail::send_invite_confirmed(&address, &org_name).await?;
     }
 
     user_to_confirm.save(conn).await
@@ -1202,11 +1207,23 @@ async fn edit_user(
     }
 
     if user_to_edit.atype == UserOrgType::Owner && new_type != UserOrgType::Owner {
-        // Removing owner permmission, check that there are at least another owner
-        let num_owners = UserOrganization::find_by_org_and_type(&org_id, UserOrgType::Owner as i32, &conn).await.len();
-
-        if num_owners <= 1 {
+        // Removing owner permmission, check that there is at least one other confirmed owner
+        if UserOrganization::count_confirmed_by_org_and_type(&org_id, UserOrgType::Owner, &conn).await <= 1 {
             err!("Can't delete the last owner")
+        }
+    }
+
+    // This check is also done at accept_invite(), _confirm_invite, _activate_user(), edit_user(), admin::update_user_org_type
+    // It returns different error messages per function.
+    if new_type < UserOrgType::Admin {
+        match OrgPolicy::is_user_allowed(&user_to_edit.user_uuid, &org_id, true, &conn).await {
+            Ok(_) => {}
+            Err(OrgPolicyErr::TwoFactorMissing) => {
+                err!("You cannot modify this user to this type because it has no two-step login method activated");
+            }
+            Err(OrgPolicyErr::SingleOrgEnforced) => {
+                err!("You cannot modify this user to this type because it is a member of an organization which forbids it");
+            }
         }
     }
 
@@ -1288,10 +1305,8 @@ async fn _delete_user(org_id: &str, org_user_id: &str, headers: &AdminHeaders, c
     }
 
     if user_to_delete.atype == UserOrgType::Owner {
-        // Removing owner, check that there are at least another owner
-        let num_owners = UserOrganization::find_by_org_and_type(org_id, UserOrgType::Owner as i32, conn).await.len();
-
-        if num_owners <= 1 {
+        // Removing owner, check that there is at least one other confirmed owner
+        if UserOrganization::count_confirmed_by_org_and_type(org_id, UserOrgType::Owner, conn).await <= 1 {
             err!("Can't delete the last owner")
         }
     }
@@ -1460,7 +1475,7 @@ async fn get_policy(org_id: String, pol_type: i32, _headers: AdminHeaders, conn:
         None => err!("Invalid or unsupported policy type"),
     };
 
-    let policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn).await {
+    let policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
         Some(p) => p,
         None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
     };
@@ -1488,15 +1503,16 @@ async fn put_policy(
 
     let pol_type_enum = match OrgPolicyType::from_i32(pol_type) {
         Some(pt) => pt,
-        None => err!("Invalid policy type"),
+        None => err!("Invalid or unsupported policy type"),
     };
 
-    // If enabling the TwoFactorAuthentication policy, remove this org's members that do have 2FA
+    // When enabling the TwoFactorAuthentication policy, remove this org's members that do have 2FA
     if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
         for member in UserOrganization::find_by_org(&org_id, &conn).await.into_iter() {
             let user_twofactor_disabled = TwoFactor::find_by_user(&member.user_uuid, &conn).await.is_empty();
 
             // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
+            // Invited users still need to accept the invite and will get an error when they try to accept the invite.
             if user_twofactor_disabled
                 && member.atype < UserOrgType::Admin
                 && member.status != UserOrgStatus::Invited as i32
@@ -1505,40 +1521,36 @@ async fn put_policy(
                     let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
                     let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
 
-                    mail::send_2fa_removed_from_org(&user.email, &org.name)?;
+                    mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
                 }
                 member.delete(&conn).await?;
             }
         }
     }
 
-    // If enabling the SingleOrg policy, remove this org's members that are members of other orgs
+    // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
     if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
         for member in UserOrganization::find_by_org(&org_id, &conn).await.into_iter() {
             // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
-            if member.atype < UserOrgType::Admin && member.status != UserOrgStatus::Invited as i32 {
-                let is_member_of_another_org = UserOrganization::find_any_state_by_user(&member.user_uuid, &conn)
-                    .await
-                    .into_iter()
-                    // Other UserOrganization's where they have accepted being a member of
-                    .filter(|uo| uo.uuid != member.uuid && uo.status != UserOrgStatus::Invited as i32)
-                    .count()
-                    > 1;
+            // Exclude invited and revoked users when checking for this policy.
+            // Those users will not be allowed to accept or be activated because of the policy checks done there.
+            // We check if the count is larger then 1, because it includes this organization also.
+            if member.atype < UserOrgType::Admin
+                && member.status != UserOrgStatus::Invited as i32
+                && UserOrganization::count_accepted_and_confirmed_by_user(&member.user_uuid, &conn).await > 1
+            {
+                if CONFIG.mail_enabled() {
+                    let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
+                    let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
 
-                if is_member_of_another_org {
-                    if CONFIG.mail_enabled() {
-                        let org = Organization::find_by_uuid(&member.org_uuid, &conn).await.unwrap();
-                        let user = User::find_by_uuid(&member.user_uuid, &conn).await.unwrap();
-
-                        mail::send_single_org_removed_from_org(&user.email, &org.name)?;
-                    }
-                    member.delete(&conn).await?;
+                    mail::send_single_org_removed_from_org(&user.email, &org.name).await?;
                 }
+                member.delete(&conn).await?;
             }
         }
     }
 
-    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn).await {
+    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
         Some(p) => p,
         None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
     };
@@ -1561,7 +1573,7 @@ fn get_organization_tax(org_id: String, _headers: Headers) -> Json<Value> {
 }
 
 #[get("/plans")]
-fn get_plans(_headers: Headers) -> Json<Value> {
+fn get_plans() -> Json<Value> {
     // Respond with a minimal json just enough to allow the creation of an new organization.
     Json(json!({
         "Object": "list",
@@ -1669,7 +1681,8 @@ async fn import(org_id: String, data: JsonUpcase<OrgImportData>, headers: Header
                         Some(new_org_user.uuid),
                         &org_name,
                         Some(headers.user.email.clone()),
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -1677,7 +1690,7 @@ async fn import(org_id: String, data: JsonUpcase<OrgImportData>, headers: Header
 
     // If this flag is enabled, any user that isn't provided in the Users list will be removed (by default they will be kept unless they have Deleted == true)
     if data.OverwriteExisting {
-        for user_org in UserOrganization::find_by_org_and_type(&org_id, UserOrgType::User as i32, &conn).await {
+        for user_org in UserOrganization::find_by_org_and_type(&org_id, UserOrgType::User, &conn).await {
             if let Some(user_email) = User::find_by_uuid(&user_org.user_uuid, &conn).await.map(|u| u.email) {
                 if !data.Users.iter().any(|u| u.Email == user_email) {
                     user_org.delete(&conn).await?;
@@ -1687,4 +1700,227 @@ async fn import(org_id: String, data: JsonUpcase<OrgImportData>, headers: Header
     }
 
     Ok(())
+}
+
+// Pre web-vault v2022.9.x endpoint
+#[put("/organizations/<org_id>/users/<org_user_id>/deactivate")]
+async fn deactivate_organization_user(
+    org_id: String,
+    org_user_id: String,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> EmptyResult {
+    _revoke_organization_user(&org_id, &org_user_id, &headers, &conn).await
+}
+
+// Pre web-vault v2022.9.x endpoint
+#[put("/organizations/<org_id>/users/deactivate", data = "<data>")]
+async fn bulk_deactivate_organization_user(
+    org_id: String,
+    data: JsonUpcase<Value>,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> Json<Value> {
+    bulk_revoke_organization_user(org_id, data, headers, conn).await
+}
+
+#[put("/organizations/<org_id>/users/<org_user_id>/revoke")]
+async fn revoke_organization_user(
+    org_id: String,
+    org_user_id: String,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> EmptyResult {
+    _revoke_organization_user(&org_id, &org_user_id, &headers, &conn).await
+}
+
+#[put("/organizations/<org_id>/users/revoke", data = "<data>")]
+async fn bulk_revoke_organization_user(
+    org_id: String,
+    data: JsonUpcase<Value>,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> Json<Value> {
+    let data = data.into_inner().data;
+
+    let mut bulk_response = Vec::new();
+    match data["Ids"].as_array() {
+        Some(org_users) => {
+            for org_user_id in org_users {
+                let org_user_id = org_user_id.as_str().unwrap_or_default();
+                let err_msg = match _revoke_organization_user(&org_id, org_user_id, &headers, &conn).await {
+                    Ok(_) => String::from(""),
+                    Err(e) => format!("{:?}", e),
+                };
+
+                bulk_response.push(json!(
+                    {
+                        "Object": "OrganizationUserBulkResponseModel",
+                        "Id": org_user_id,
+                        "Error": err_msg
+                    }
+                ));
+            }
+        }
+        None => error!("No users to revoke"),
+    }
+
+    Json(json!({
+        "Data": bulk_response,
+        "Object": "list",
+        "ContinuationToken": null
+    }))
+}
+
+async fn _revoke_organization_user(
+    org_id: &str,
+    org_user_id: &str,
+    headers: &AdminHeaders,
+    conn: &DbConn,
+) -> EmptyResult {
+    match UserOrganization::find_by_uuid_and_org(org_user_id, org_id, conn).await {
+        Some(mut user_org) if user_org.status > UserOrgStatus::Revoked as i32 => {
+            if user_org.user_uuid == headers.user.uuid {
+                err!("You cannot revoke yourself")
+            }
+            if user_org.atype == UserOrgType::Owner && headers.org_user_type != UserOrgType::Owner {
+                err!("Only owners can revoke other owners")
+            }
+            if user_org.atype == UserOrgType::Owner
+                && UserOrganization::count_confirmed_by_org_and_type(org_id, UserOrgType::Owner, conn).await <= 1
+            {
+                err!("Organization must have at least one confirmed owner")
+            }
+
+            user_org.revoke();
+            user_org.save(conn).await?;
+        }
+        Some(_) => err!("User is already revoked"),
+        None => err!("User not found in organization"),
+    }
+    Ok(())
+}
+
+// Pre web-vault v2022.9.x endpoint
+#[put("/organizations/<org_id>/users/<org_user_id>/activate")]
+async fn activate_organization_user(
+    org_id: String,
+    org_user_id: String,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> EmptyResult {
+    _restore_organization_user(&org_id, &org_user_id, &headers, &conn).await
+}
+
+// Pre web-vault v2022.9.x endpoint
+#[put("/organizations/<org_id>/users/activate", data = "<data>")]
+async fn bulk_activate_organization_user(
+    org_id: String,
+    data: JsonUpcase<Value>,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> Json<Value> {
+    bulk_restore_organization_user(org_id, data, headers, conn).await
+}
+
+#[put("/organizations/<org_id>/users/<org_user_id>/restore")]
+async fn restore_organization_user(
+    org_id: String,
+    org_user_id: String,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> EmptyResult {
+    _restore_organization_user(&org_id, &org_user_id, &headers, &conn).await
+}
+
+#[put("/organizations/<org_id>/users/restore", data = "<data>")]
+async fn bulk_restore_organization_user(
+    org_id: String,
+    data: JsonUpcase<Value>,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> Json<Value> {
+    let data = data.into_inner().data;
+
+    let mut bulk_response = Vec::new();
+    match data["Ids"].as_array() {
+        Some(org_users) => {
+            for org_user_id in org_users {
+                let org_user_id = org_user_id.as_str().unwrap_or_default();
+                let err_msg = match _restore_organization_user(&org_id, org_user_id, &headers, &conn).await {
+                    Ok(_) => String::from(""),
+                    Err(e) => format!("{:?}", e),
+                };
+
+                bulk_response.push(json!(
+                    {
+                        "Object": "OrganizationUserBulkResponseModel",
+                        "Id": org_user_id,
+                        "Error": err_msg
+                    }
+                ));
+            }
+        }
+        None => error!("No users to restore"),
+    }
+
+    Json(json!({
+        "Data": bulk_response,
+        "Object": "list",
+        "ContinuationToken": null
+    }))
+}
+
+async fn _restore_organization_user(
+    org_id: &str,
+    org_user_id: &str,
+    headers: &AdminHeaders,
+    conn: &DbConn,
+) -> EmptyResult {
+    match UserOrganization::find_by_uuid_and_org(org_user_id, org_id, conn).await {
+        Some(mut user_org) if user_org.status < UserOrgStatus::Accepted as i32 => {
+            if user_org.user_uuid == headers.user.uuid {
+                err!("You cannot restore yourself")
+            }
+            if user_org.atype == UserOrgType::Owner && headers.org_user_type != UserOrgType::Owner {
+                err!("Only owners can restore other owners")
+            }
+
+            // This check is also done at accept_invite(), _confirm_invite, _activate_user(), edit_user(), admin::update_user_org_type
+            // It returns different error messages per function.
+            if user_org.atype < UserOrgType::Admin {
+                match OrgPolicy::is_user_allowed(&user_org.user_uuid, org_id, false, conn).await {
+                    Ok(_) => {}
+                    Err(OrgPolicyErr::TwoFactorMissing) => {
+                        err!("You cannot restore this user because it has no two-step login method activated");
+                    }
+                    Err(OrgPolicyErr::SingleOrgEnforced) => {
+                        err!("You cannot restore this user because it is a member of an organization which forbids it");
+                    }
+                }
+            }
+
+            user_org.restore();
+            user_org.save(conn).await?;
+        }
+        Some(_) => err!("User is already active"),
+        None => err!("User not found in organization"),
+    }
+    Ok(())
+}
+
+// This is a new function active since the v2022.9.x clients.
+// It combines the previous two calls done before.
+// We call those two functions here and combine them our selfs.
+//
+// NOTE: It seems clients can't handle uppercase-first keys!!
+//       We need to convert all keys so they have the first character to be a lowercase.
+//       Else the export will be just an empty JSON file.
+#[get("/organizations/<org_id>/export")]
+async fn get_org_export(org_id: String, headers: AdminHeaders, conn: DbConn) -> Json<Value> {
+    // Also both main keys here need to be lowercase, else the export will fail.
+    Json(json!({
+        "collections": convert_json_key_lcase_first(_get_org_collections(&org_id, &conn).await),
+        "ciphers": convert_json_key_lcase_first(_get_org_details(&org_id, &headers.host, &headers.user.uuid, &conn).await),
+    }))
 }
